@@ -1,5 +1,5 @@
 /**
- * Slack Worker - Process events asynchronously
+ * Slack Worker - Process events with Claude + HubSpot tools
  */
 
 const express = require('express');
@@ -11,179 +11,332 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Initialize Claude client
-const claude = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY
-});
+const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-/**
- * Health check endpoint
- */
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+// ─── HubSpot API Client ───────────────────────────────────────────────────────
 
-/**
- * Process Slack event
- * Called by main Vercel app when an event arrives
- */
-app.post('/process', async (req, res) => {
-  try {
-    console.log('[WORKER] Processing event:', req.body.event?.type);
-    
-    const { event, token } = req.body;
-    
-    if (!event || !token) {
-      return res.status(400).json({ error: 'Missing event or token' });
-    }
+function hubspotRequest(method, path, body = null) {
+  return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const options = {
+      hostname: 'api.hubapi.com',
+      port: 443,
+      path,
+      method,
+      headers: {
+        'Authorization': `Bearer ${process.env.HUBSPOT_PRIVATE_APP_TOKEN}`,
+        'Content-Type': 'application/json',
+        ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {})
+      }
+    };
 
-    // Respond immediately so caller knows we got it
-    res.status(200).json({ queued: true });
-
-    // Now process async
-    processEvent(event, token).catch(error => {
-      console.error('[WORKER ERROR]', error.message);
+    const req = https.request(options, (res) => {
+      let raw = '';
+      res.on('data', c => raw += c);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(raw);
+          if (res.statusCode >= 400) reject(new Error(`HubSpot ${res.statusCode}: ${parsed.message}`));
+          else resolve(parsed);
+        } catch (e) { reject(e); }
+      });
     });
 
-  } catch (error) {
-    console.error('[WORKER] Error:', error.message);
-    res.status(500).json({ error: error.message });
+    req.on('error', reject);
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('HubSpot timeout')); });
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+// ─── Tool Definitions ─────────────────────────────────────────────────────────
+
+const TOOL_DEFINITIONS = [
+  {
+    name: 'search_contacts',
+    description: 'Search HubSpot contacts by name, email, or company. Also supports filtering by creation date (e.g. contacts created today or this week).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Name, email, or company to search for. Leave empty to list recent contacts.' },
+        created_after: { type: 'string', description: 'ISO date string (e.g. "2025-06-17T00:00:00Z") to filter contacts created after this date.' },
+        limit: { type: 'integer', description: 'Max results (1-100, default 10)', default: 10 }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'search_deals',
+    description: 'Search HubSpot deals with optional filters by stage or amount.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        dealstage: { type: 'string', description: 'Deal stage e.g. closedwon, closedlost, negotiation, proposal' },
+        amount_min: { type: 'number', description: 'Minimum deal amount' },
+        amount_max: { type: 'number', description: 'Maximum deal amount' },
+        limit: { type: 'integer', description: 'Max results (1-100, default 10)', default: 10 }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'search_companies',
+    description: 'Search HubSpot companies by name or domain.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Company name or domain' },
+        limit: { type: 'integer', description: 'Max results (1-100, default 10)', default: 10 }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'get_contact',
+    description: 'Get full details for a specific contact by HubSpot ID.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string', description: 'HubSpot Contact ID' }
+      },
+      required: ['contact_id']
+    }
+  },
+  {
+    name: 'get_deal',
+    description: 'Get full details for a specific deal by HubSpot ID.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string', description: 'HubSpot Deal ID' }
+      },
+      required: ['deal_id']
+    }
+  },
+  {
+    name: 'get_company',
+    description: 'Get full details for a specific company by HubSpot ID.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        company_id: { type: 'string', description: 'HubSpot Company ID' }
+      },
+      required: ['company_id']
+    }
   }
-});
+];
 
-/**
- * Process the event asynchronously
- */
-async function processEvent(event, slackToken) {
+// ─── Tool Executor ────────────────────────────────────────────────────────────
+
+async function executeTool(name, input) {
   try {
-    console.log('[PROCESS] Starting for event type:', event.type);
+    switch (name) {
+      case 'search_contacts': {
+        const filterGroups = [];
+        if (input.created_after) {
+          filterGroups.push({
+            filters: [{
+              propertyName: 'createdate',
+              operator: 'GTE',
+              value: new Date(input.created_after).getTime().toString()
+            }]
+          });
+        }
+        const body = {
+          limit: Math.min(input.limit || 10, 100),
+          properties: ['firstname', 'lastname', 'email', 'phone', 'company', 'createdate', 'hs_lead_status'],
+          sorts: [{ propertyName: 'createdate', direction: 'DESCENDING' }],
+          ...(input.query ? { query: input.query } : {}),
+          ...(filterGroups.length > 0 ? { filterGroups } : {})
+        };
+        const res = await hubspotRequest('POST', '/crm/v3/objects/contacts/search', body);
+        return { success: true, total: res.results?.length || 0, results: res.results?.map(c => ({ id: c.id, ...c.properties })) };
+      }
 
-    const slack = new SlackClient(slackToken);
+      case 'search_deals': {
+        const filterGroups = [];
+        if (input.dealstage) filterGroups.push({ filters: [{ propertyName: 'dealstage', operator: 'EQ', value: input.dealstage }] });
+        if (input.amount_min) filterGroups.push({ filters: [{ propertyName: 'amount', operator: 'GTE', value: String(input.amount_min) }] });
+        if (input.amount_max) filterGroups.push({ filters: [{ propertyName: 'amount', operator: 'LTE', value: String(input.amount_max) }] });
+        const body = {
+          limit: Math.min(input.limit || 10, 100),
+          properties: ['dealname', 'dealstage', 'amount', 'closedate', 'pipeline'],
+          sorts: [{ propertyName: 'amount', direction: 'DESCENDING' }],
+          ...(filterGroups.length > 0 ? { filterGroups } : {})
+        };
+        const res = await hubspotRequest('POST', '/crm/v3/objects/deals/search', body);
+        return { success: true, total: res.results?.length || 0, results: res.results?.map(d => ({ id: d.id, ...d.properties })) };
+      }
 
-    // Only process mentions and DMs
-    const isMention = event.type === 'app_mention';
-    const isDM = event.type === 'message' && event.channel_type === 'im';
+      case 'search_companies': {
+        const body = {
+          limit: Math.min(input.limit || 10, 100),
+          query: input.query,
+          properties: ['name', 'domain', 'industry', 'annualrevenue', 'hs_lead_status'],
+          sorts: [{ propertyName: 'name', direction: 'ASCENDING' }]
+        };
+        const res = await hubspotRequest('POST', '/crm/v3/objects/companies/search', body);
+        return { success: true, total: res.results?.length || 0, results: res.results?.map(c => ({ id: c.id, ...c.properties })) };
+      }
 
-    if (!isMention && !isDM) {
-      console.log('[PROCESS] Ignoring event type:', event.type);
-      return;
+      case 'get_contact': {
+        const props = 'firstname,lastname,email,phone,company,createdate,hs_lead_status,jobtitle';
+        const res = await hubspotRequest('GET', `/crm/v3/objects/contacts/${input.contact_id}?properties=${props}`);
+        return { success: true, id: res.id, ...res.properties };
+      }
+
+      case 'get_deal': {
+        const props = 'dealname,dealstage,amount,closedate,pipeline,description';
+        const res = await hubspotRequest('GET', `/crm/v3/objects/deals/${input.deal_id}?properties=${props}`);
+        return { success: true, id: res.id, ...res.properties };
+      }
+
+      case 'get_company': {
+        const props = 'name,domain,industry,annualrevenue,hs_lead_status,website,city,country';
+        const res = await hubspotRequest('GET', `/crm/v3/objects/companies/${input.company_id}?properties=${props}`);
+        return { success: true, id: res.id, ...res.properties };
+      }
+
+      default:
+        return { error: `Unknown tool: ${name}` };
     }
+  } catch (err) {
+    console.error(`[TOOL ERROR] ${name}:`, err.message);
+    return { error: err.message };
+  }
+}
 
-    // Extract question
-    const question = event.text?.replace(/<@[A-Z0-9]+>/g, '').trim();
-    if (!question) {
-      console.log('[PROCESS] No question text');
-      return;
-    }
+// ─── Claude with Tool Use ─────────────────────────────────────────────────────
 
-    console.log('[PROCESS] Question:', question);
+async function askClaude(question) {
+  const messages = [{ role: 'user', content: question }];
+  const now = new Date().toISOString();
 
-    // Add hourglass reaction
-    await slack.addReaction(event.channel, event.ts, 'hourglass_flowing_sand').catch(() => {});
-
-    // Call Claude to generate response
-    console.log('[PROCESS] Calling Claude...');
+  for (let i = 0; i < 6; i++) {
     const response = await claude.messages.create({
       model: 'claude-opus-4-8',
-      max_tokens: 500,
-      system: 'You are a helpful HubSpot assistant for Saras Analytics. Answer questions about CRM data concisely.',
-      messages: [
-        { role: 'user', content: question }
-      ]
+      max_tokens: 1024,
+      system: `You are a HubSpot CRM assistant for Saras Analytics.
+Use the provided tools to look up real CRM data and give specific, data-driven answers.
+Current date/time: ${now}
+Always use tools to fetch actual data before answering — never say you "don't have access".`,
+      tools: TOOL_DEFINITIONS,
+      messages
     });
 
-    const answer = response.content[0]?.type === 'text' ? response.content[0].text : 'No response generated';
-    console.log('[PROCESS] Got response from Claude');
+    if (response.stop_reason === 'end_turn') {
+      const text = response.content.find(b => b.type === 'text');
+      return text?.text || 'Done.';
+    }
 
-    // Post response to Slack
-    await slack.postMessage(
-      event.channel,
-      [{ type: 'section', text: { type: 'mrkdwn', text: answer } }],
-      { thread_ts: event.thread_ts || event.ts }
-    );
+    if (response.stop_reason !== 'tool_use') {
+      const text = response.content.find(b => b.type === 'text');
+      return text?.text || 'Done.';
+    }
 
-    console.log('[PROCESS] Posted response to Slack');
+    // Execute all tool calls
+    const toolCalls = response.content.filter(b => b.type === 'tool_use');
+    const toolResults = [];
 
-    // Remove hourglass
-    await slack.addReaction(event.channel, event.ts, '-hourglass_flowing_sand').catch(() => {});
+    for (const call of toolCalls) {
+      console.log(`[WORKER] Tool call: ${call.name}`, JSON.stringify(call.input));
+      const result = await executeTool(call.name, call.input);
+      console.log(`[WORKER] Tool result: ${call.name} →`, JSON.stringify(result).slice(0, 200));
+      toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: JSON.stringify(result) });
+    }
 
-    console.log('[PROCESS] Complete');
-  } catch (error) {
-    console.error('[PROCESS ERROR]', error.message);
+    messages.push({ role: 'assistant', content: response.content });
+    messages.push({ role: 'user', content: toolResults });
   }
+
+  return 'Reached max iterations — please try a more specific question.';
 }
 
-/**
- * Simple Slack client
- */
-class SlackClient {
-  constructor(token) {
-    this.token = token;
-  }
+// ─── Slack Client ─────────────────────────────────────────────────────────────
 
-  async postMessage(channel, blocks, options = {}) {
-    const payload = {
-      channel,
-      blocks,
-      thread_ts: options.thread_ts,
-      reply_broadcast: options.reply_broadcast || false,
-      text: 'Message from HubSpot Agent'
+function slackRequest(endpoint, payload, token) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(payload);
+    const options = {
+      hostname: 'slack.com',
+      port: 443,
+      path: `/api${endpoint}`,
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data)
+      }
     };
 
-    return this.request('/chat.postMessage', payload);
-  }
-
-  async addReaction(channel, timestamp, emoji) {
-    const payload = {
-      channel,
-      timestamp,
-      name: emoji.replace(/:/g, '')
-    };
-
-    return this.request('/reactions.add', payload);
-  }
-
-  async request(endpoint, payload) {
-    return new Promise((resolve, reject) => {
-      const data = JSON.stringify(payload);
-
-      const options = {
-        hostname: 'slack.com',
-        port: 443,
-        path: `/api${endpoint}`,
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${this.token}`,
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(data)
-        }
-      };
-
-      const req = https.request(options, (res) => {
-        let body = '';
-        res.on('data', chunk => body += chunk);
-        res.on('end', () => {
-          try {
-            const parsed = JSON.parse(body);
-            if (!parsed.ok) {
-              reject(new Error(`Slack error: ${parsed.error}`));
-            } else {
-              resolve(parsed);
-            }
-          } catch (e) {
-            reject(new Error(`Failed to parse response: ${body}`));
-          }
-        });
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(body);
+          if (!parsed.ok) reject(new Error(`Slack error: ${parsed.error}`));
+          else resolve(parsed);
+        } catch (e) { reject(e); }
       });
-
-      req.on('error', reject);
-      req.write(data);
-      req.end();
     });
-  }
+
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
 }
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`[WORKER] Listening on port ${PORT}`);
+// ─── Event Processor ─────────────────────────────────────────────────────────
+
+async function processEvent(event, slackToken) {
+  console.log('[PROCESS] event:', event.type, 'channel:', event.channel);
+
+  const isMention = event.type === 'app_mention';
+  const isDM = event.type === 'message' && event.channel_type === 'im';
+  if (!isMention && !isDM) return;
+
+  const question = event.text?.replace(/<@[A-Z0-9]+>/g, '').trim();
+  if (!question) return;
+
+  console.log('[PROCESS] Question:', question);
+
+  // Hourglass while thinking
+  await slackRequest('/reactions.add', { channel: event.channel, timestamp: event.ts, name: 'hourglass_flowing_sand' }, slackToken).catch(() => {});
+
+  let answer;
+  try {
+    answer = await askClaude(question);
+  } catch (err) {
+    console.error('[PROCESS] Claude error:', err.message);
+    answer = `Sorry, I ran into an error: ${err.message}`;
+  }
+
+  // Post reply in thread
+  await slackRequest('/chat.postMessage', {
+    channel: event.channel,
+    thread_ts: event.thread_ts || event.ts,
+    text: answer,
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: answer } }]
+  }, slackToken);
+
+  // Remove hourglass
+  await slackRequest('/reactions.remove', { channel: event.channel, timestamp: event.ts, name: 'hourglass_flowing_sand' }, slackToken).catch(() => {});
+
+  console.log('[PROCESS] Done');
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.post('/process', async (req, res) => {
+  const { event, token } = req.body;
+  if (!event || !token) return res.status(400).json({ error: 'Missing event or token' });
+
+  res.status(200).json({ queued: true });
+
+  processEvent(event, token).catch(err => console.error('[WORKER ERROR]', err.message));
 });
+
+app.listen(PORT, () => console.log(`[WORKER] Listening on port ${PORT}`));
