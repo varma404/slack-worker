@@ -317,7 +317,7 @@ async function askClaude(question) {
 
   for (let i = 0; i < 12; i++) {
     const response = await claude.messages.create({
-      model: 'claude-opus-4-8',
+      model: 'claude-sonnet-4-6',
       max_tokens: 4096,
       system: `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
