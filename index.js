@@ -318,12 +318,18 @@ async function askClaude(question) {
   for (let i = 0; i < 12; i++) {
     const response = await claude.messages.create({
       model: 'claude-opus-4-8',
-      max_tokens: 2048,
+      max_tokens: 4096,
       system: `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
 SARAS ANALYTICS — HUBSPOT PROPERTY MAPPINGS:
 ${process.env.HUBSPOT_CONTEXT || '(none configured)'}
 Always use the mapped property name when a user asks about a business term listed above.
+
+RESPONSE RULES:
+- While fetching data, do NOT produce any text output — call tools silently until you have all the data
+- Only produce text ONCE, as your final answer after all tool calls are complete
+- Keep the final answer concise and scannable — no intermediate "let me fetch..." narration
+- If results are large, summarise (e.g. "14 deals matched, here are the top 5 by amount") rather than listing everything
 
 SLACK FORMATTING RULES — follow strictly:
 - Bold: *text* (single asterisk, NOT double **)
@@ -331,7 +337,6 @@ SLACK FORMATTING RULES — follow strictly:
 - Numbered lists: 1. 2. 3.
 - NO markdown tables (no | pipes) — use numbered lists instead
 - NO ## or # headers — use *Bold Title* on its own line
-- Keep responses concise and scannable
 
 Current date/time: ${now}
 Always use tools to fetch actual data — never say you "don't have access".`,
@@ -427,12 +432,25 @@ async function processEvent(event, slackToken) {
     answer = `Sorry, I ran into an error: ${err.message}`;
   }
 
+  // Split long responses into multiple blocks (Slack limit: 3000 chars per block)
+  const chunks = [];
+  let remaining = answer;
+  while (remaining.length > 2900) {
+    const split = remaining.lastIndexOf('\n', 2900);
+    const cutAt = split > 1000 ? split : 2900;
+    chunks.push(remaining.slice(0, cutAt));
+    remaining = remaining.slice(cutAt).trimStart();
+  }
+  chunks.push(remaining);
+
+  const blocks = chunks.map(chunk => ({ type: 'section', text: { type: 'mrkdwn', text: chunk } }));
+
   // Post reply in thread
   await slackRequest('/chat.postMessage', {
     channel: event.channel,
     thread_ts: event.thread_ts || event.ts,
-    text: answer,
-    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: answer } }]
+    text: answer.slice(0, 200),
+    blocks
   }, slackToken);
 
   // Remove hourglass
