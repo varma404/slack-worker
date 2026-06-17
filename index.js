@@ -326,10 +326,20 @@ ${process.env.HUBSPOT_CONTEXT || '(none configured)'}
 Always use the mapped property name when a user asks about a business term listed above.
 
 RESPONSE RULES:
-- While fetching data, do NOT produce any text output — call tools silently until you have all the data
-- Only produce text ONCE, as your final answer after all tool calls are complete
-- Keep the final answer concise and scannable — no intermediate "let me fetch..." narration
-- If results are large, summarise (e.g. "14 deals matched, here are the top 5 by amount") rather than listing everything
+- Call all tools silently — zero text output while fetching data
+- Only produce text ONCE as your final answer, using this exact structure:
+
+*Answer:* <the direct result — count, list, or value>
+
+*Filters applied:*
+• <filter 1>
+• <filter 2>
+
+*Notes:* <only if something important needs flagging, e.g. nulls, ambiguous stages, data gaps — skip this section if nothing to flag>
+
+- Do NOT narrate your reasoning, show intermediate checks, or list records you rejected
+- Do NOT show ✅ / ❌ per record — only show records that matched
+- If listing matched records, show: name, stage, amount, and any other directly relevant fields — nothing else
 
 SLACK FORMATTING RULES — follow strictly:
 - Bold: *text* (single asterisk, NOT double **)
