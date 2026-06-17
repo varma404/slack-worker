@@ -53,13 +53,57 @@ function hubspotRequest(method, path, body = null) {
 
 const TOOL_DEFINITIONS = [
   {
-    name: 'search_contacts',
-    description: 'Search HubSpot contacts by name, email, or company. Also supports filtering by creation date (e.g. contacts created today or this week).',
+    name: 'get_object_properties',
+    description: 'List all available properties (including custom ones) for a HubSpot object type. Call this first when you need to filter or retrieve a property whose name you don\'t know (e.g. MQL date, lifecycle stage, source).',
     input_schema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Name, email, or company to search for. Leave empty to list recent contacts.' },
-        created_after: { type: 'string', description: 'ISO date string (e.g. "2025-06-17T00:00:00Z") to filter contacts created after this date.' },
+        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'], description: 'The CRM object type' }
+      },
+      required: ['object_type']
+    }
+  },
+  {
+    name: 'search_objects',
+    description: 'Flexible search across any HubSpot object type with filters on any property. Use get_object_properties first if you need to find the exact property names. All filters in the list are AND\'d together. For date values use milliseconds since epoch (e.g. new Date("2026-06-10").getTime()).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'], description: 'The CRM object type to search' },
+        filters: {
+          type: 'array',
+          description: 'Filters — all AND\'d together',
+          items: {
+            type: 'object',
+            properties: {
+              property: { type: 'string', description: 'HubSpot property name (e.g. lifecyclestage, hs_analytics_source, hs_date_entered_marketingqualifiedlead)' },
+              operator: { type: 'string', enum: ['EQ', 'NEQ', 'LT', 'LTE', 'GT', 'GTE', 'BETWEEN', 'HAS_PROPERTY', 'NOT_HAS_PROPERTY', 'CONTAINS_TOKEN', 'NOT_CONTAINS_TOKEN'], description: 'Comparison operator' },
+              value: { type: 'string', description: 'Filter value. For dates use ms since epoch as a string.' },
+              high_value: { type: 'string', description: 'Upper bound for BETWEEN operator only' }
+            },
+            required: ['property', 'operator']
+          }
+        },
+        properties: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Property names to return in results. Include any custom properties you need.'
+        },
+        sort_by: { type: 'string', description: 'Property to sort by (default: createdate)' },
+        sort_direction: { type: 'string', enum: ['ASCENDING', 'DESCENDING'], description: 'Sort direction (default: DESCENDING)' },
+        limit: { type: 'integer', description: 'Max results 1-100 (default 20)', default: 20 }
+      },
+      required: ['object_type']
+    }
+  },
+  {
+    name: 'search_contacts',
+    description: 'Quick text search for contacts by name, email, or company. For filtering by custom properties or dates use search_objects instead.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Name, email, or company to search for.' },
+        created_after: { type: 'string', description: 'ISO date string to filter contacts created after this date.' },
         limit: { type: 'integer', description: 'Max results (1-100, default 10)', default: 10 }
       },
       required: []
@@ -67,7 +111,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'search_deals',
-    description: 'Search HubSpot deals with optional filters by stage or amount.',
+    description: 'Search HubSpot deals with optional filters by stage or amount. For custom property filters use search_objects instead.',
     input_schema: {
       type: 'object',
       properties: {
@@ -80,24 +124,13 @@ const TOOL_DEFINITIONS = [
     }
   },
   {
-    name: 'search_companies',
-    description: 'Search HubSpot companies by name or domain.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Company name or domain' },
-        limit: { type: 'integer', description: 'Max results (1-100, default 10)', default: 10 }
-      },
-      required: ['query']
-    }
-  },
-  {
     name: 'get_contact',
     description: 'Get full details for a specific contact by HubSpot ID.',
     input_schema: {
       type: 'object',
       properties: {
-        contact_id: { type: 'string', description: 'HubSpot Contact ID' }
+        contact_id: { type: 'string', description: 'HubSpot Contact ID' },
+        properties: { type: 'array', items: { type: 'string' }, description: 'Extra property names to include (custom properties)' }
       },
       required: ['contact_id']
     }
@@ -108,7 +141,8 @@ const TOOL_DEFINITIONS = [
     input_schema: {
       type: 'object',
       properties: {
-        deal_id: { type: 'string', description: 'HubSpot Deal ID' }
+        deal_id: { type: 'string', description: 'HubSpot Deal ID' },
+        properties: { type: 'array', items: { type: 'string' }, description: 'Extra property names to include (custom properties)' }
       },
       required: ['deal_id']
     }
@@ -119,7 +153,8 @@ const TOOL_DEFINITIONS = [
     input_schema: {
       type: 'object',
       properties: {
-        company_id: { type: 'string', description: 'HubSpot Company ID' }
+        company_id: { type: 'string', description: 'HubSpot Company ID' },
+        properties: { type: 'array', items: { type: 'string' }, description: 'Extra property names to include (custom properties)' }
       },
       required: ['company_id']
     }
@@ -131,6 +166,45 @@ const TOOL_DEFINITIONS = [
 async function executeTool(name, input) {
   try {
     switch (name) {
+
+      case 'get_object_properties': {
+        const res = await hubspotRequest('GET', `/crm/v3/properties/${input.object_type}`);
+        // Return name, label, type — skip internal hs_ prefixed calculated fields to keep response small
+        const props = (res.results || [])
+          .map(p => ({ name: p.name, label: p.label, type: p.type, fieldType: p.fieldType }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        return { total: props.length, properties: props };
+      }
+
+      case 'search_objects': {
+        const filters = (input.filters || []).map(f => ({
+          propertyName: f.property,
+          operator: f.operator,
+          ...(f.value !== undefined ? { value: f.value } : {}),
+          ...(f.high_value !== undefined ? { highValue: f.high_value } : {})
+        }));
+        const defaultProps = {
+          contacts: ['firstname', 'lastname', 'email', 'createdate', 'lifecyclestage', 'hs_lead_status'],
+          companies: ['name', 'domain', 'createdate', 'lifecyclestage', 'hs_analytics_source', 'hs_analytics_source_data_1'],
+          deals: ['dealname', 'dealstage', 'amount', 'closedate', 'pipeline']
+        };
+        const properties = input.properties?.length
+          ? input.properties
+          : defaultProps[input.object_type] || ['createdate'];
+        const body = {
+          limit: Math.min(input.limit || 20, 100),
+          properties,
+          sorts: [{ propertyName: input.sort_by || 'createdate', direction: input.sort_direction || 'DESCENDING' }],
+          ...(filters.length > 0 ? { filterGroups: [{ filters }] } : {})
+        };
+        const res = await hubspotRequest('POST', `/crm/v3/objects/${input.object_type}/search`, body);
+        return {
+          total: res.total || res.results?.length || 0,
+          returned: res.results?.length || 0,
+          results: res.results?.map(r => ({ id: r.id, ...r.properties }))
+        };
+      }
+
       case 'search_contacts': {
         const filterGroups = [];
         if (input.created_after) {
@@ -180,21 +254,24 @@ async function executeTool(name, input) {
       }
 
       case 'get_contact': {
-        const props = 'firstname,lastname,email,phone,company,createdate,hs_lead_status,jobtitle';
+        const baseProps = ['firstname', 'lastname', 'email', 'phone', 'company', 'createdate', 'hs_lead_status', 'jobtitle', 'lifecyclestage'];
+        const props = [...new Set([...baseProps, ...(input.properties || [])])].join(',');
         const res = await hubspotRequest('GET', `/crm/v3/objects/contacts/${input.contact_id}?properties=${props}`);
-        return { success: true, id: res.id, ...res.properties };
+        return { id: res.id, ...res.properties };
       }
 
       case 'get_deal': {
-        const props = 'dealname,dealstage,amount,closedate,pipeline,description';
+        const baseProps = ['dealname', 'dealstage', 'amount', 'closedate', 'pipeline', 'description'];
+        const props = [...new Set([...baseProps, ...(input.properties || [])])].join(',');
         const res = await hubspotRequest('GET', `/crm/v3/objects/deals/${input.deal_id}?properties=${props}`);
-        return { success: true, id: res.id, ...res.properties };
+        return { id: res.id, ...res.properties };
       }
 
       case 'get_company': {
-        const props = 'name,domain,industry,annualrevenue,hs_lead_status,website,city,country';
+        const baseProps = ['name', 'domain', 'industry', 'annualrevenue', 'hs_lead_status', 'website', 'city', 'country', 'lifecyclestage'];
+        const props = [...new Set([...baseProps, ...(input.properties || [])])].join(',');
         const res = await hubspotRequest('GET', `/crm/v3/objects/companies/${input.company_id}?properties=${props}`);
-        return { success: true, id: res.id, ...res.properties };
+        return { id: res.id, ...res.properties };
       }
 
       default:
@@ -215,7 +292,7 @@ async function askClaude(question) {
   for (let i = 0; i < 6; i++) {
     const response = await claude.messages.create({
       model: 'claude-opus-4-8',
-      max_tokens: 1024,
+      max_tokens: 2048,
       system: `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
 SLACK FORMATTING RULES — follow strictly:
