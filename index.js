@@ -65,7 +65,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'search_objects',
-    description: 'Flexible search across any HubSpot object type with filters on any property. Use get_object_properties first if you need to find the exact property names. All filters in the list are AND\'d together. For date values use milliseconds since epoch (e.g. new Date("2026-06-10").getTime()).',
+    description: 'Flexible search across any HubSpot object type with filters on any property. Use get_object_properties first if you need to find the exact property names. All filters in the list are AND\'d together. For date values use ISO date strings like "2026-06-09" — they are automatically converted to the correct format. Never compute milliseconds manually.',
     input_schema: {
       type: 'object',
       properties: {
@@ -78,7 +78,7 @@ const TOOL_DEFINITIONS = [
             properties: {
               property: { type: 'string', description: 'HubSpot property name (e.g. lifecyclestage, hs_analytics_source, hs_date_entered_marketingqualifiedlead)' },
               operator: { type: 'string', enum: ['EQ', 'NEQ', 'LT', 'LTE', 'GT', 'GTE', 'BETWEEN', 'HAS_PROPERTY', 'NOT_HAS_PROPERTY', 'CONTAINS_TOKEN', 'NOT_CONTAINS_TOKEN'], description: 'Comparison operator' },
-              value: { type: 'string', description: 'Filter value. For dates use ms since epoch as a string.' },
+              value: { type: 'string', description: 'Filter value. For dates use ISO format: "2026-06-09" or "2026-06-09T00:00:00Z". Do NOT compute milliseconds manually.' },
               high_value: { type: 'string', description: 'Upper bound for BETWEEN operator only' }
             },
             required: ['property', 'operator']
@@ -177,11 +177,18 @@ async function executeTool(name, input) {
       }
 
       case 'search_objects': {
+        // Auto-convert ISO date strings to HubSpot ms-since-epoch format
+        function toHubSpotValue(v) {
+          if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v)) {
+            return String(new Date(v).getTime());
+          }
+          return v;
+        }
         const filters = (input.filters || []).map(f => ({
           propertyName: f.property,
           operator: f.operator,
-          ...(f.value !== undefined ? { value: f.value } : {}),
-          ...(f.high_value !== undefined ? { highValue: f.high_value } : {})
+          ...(f.value !== undefined ? { value: toHubSpotValue(f.value) } : {}),
+          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
         }));
         const defaultProps = {
           contacts: ['firstname', 'lastname', 'email', 'createdate', 'lifecyclestage', 'hs_lead_status'],
