@@ -292,10 +292,8 @@ async function executeTool(name, input) {
 
 // ─── Claude with Tool Use ─────────────────────────────────────────────────────
 
-async function askClaude(question, threadHistory = []) {
-  // threadHistory: [{role: 'user'|'assistant', content: string}, ...]
-  // Current question appended as the final user turn
-  const messages = [...threadHistory, { role: 'user', content: question }];
+async function askClaude(question) {
+  const messages = [{ role: 'user', content: question }];
   const now = new Date().toISOString();
 
   for (let i = 0; i < 6; i++) {
@@ -352,18 +350,18 @@ Always use tools to fetch actual data — never say you "don't have access".`,
 
 // ─── Slack Client ─────────────────────────────────────────────────────────────
 
-function slackRequest(endpoint, payload, token, method = 'POST') {
+function slackRequest(endpoint, payload, token) {
   return new Promise((resolve, reject) => {
-    const data = payload ? JSON.stringify(payload) : null;
+    const data = JSON.stringify(payload);
     const options = {
       hostname: 'slack.com',
       port: 443,
       path: `/api${endpoint}`,
-      method,
+      method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
-        ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {})
+        'Content-Length': Buffer.byteLength(data)
       }
     };
 
@@ -380,37 +378,9 @@ function slackRequest(endpoint, payload, token, method = 'POST') {
     });
 
     req.on('error', reject);
-    if (data) req.write(data);
+    req.write(data);
     req.end();
   });
-}
-
-// ─── Thread History Fetcher ───────────────────────────────────────────────────
-
-async function getThreadHistory(channel, threadTs, currentTs, slackToken) {
-  try {
-    const res = await slackRequest(`/conversations.replies?channel=${channel}&ts=${threadTs}&limit=20`, null, slackToken, 'GET');
-    const messages = res.messages || [];
-    const history = [];
-
-    for (const msg of messages) {
-      // Skip the current message and system/join messages
-      if (msg.ts === currentTs) continue;
-      if (msg.subtype) continue;
-
-      const text = msg.text?.replace(/<@[A-Z0-9]+>/g, '').trim();
-      if (!text) continue;
-
-      // Bot messages → assistant role; human messages → user role
-      const role = msg.bot_id ? 'assistant' : 'user';
-      history.push({ role, content: text });
-    }
-
-    return history;
-  } catch (err) {
-    console.warn('[THREAD] Could not fetch history:', err.message);
-    return [];
-  }
 }
 
 // ─── Event Processor ─────────────────────────────────────────────────────────
@@ -427,20 +397,12 @@ async function processEvent(event, slackToken) {
 
   console.log('[PROCESS] Question:', question);
 
-  // Fetch thread history for follow-up questions
-  let threadHistory = [];
-  const isThreadReply = event.thread_ts && event.thread_ts !== event.ts;
-  if (isThreadReply) {
-    threadHistory = await getThreadHistory(event.channel, event.thread_ts, event.ts, slackToken);
-    console.log('[PROCESS] Thread history messages:', threadHistory.length);
-  }
-
   // Hourglass while thinking
   await slackRequest('/reactions.add', { channel: event.channel, timestamp: event.ts, name: 'hourglass_flowing_sand' }, slackToken).catch(() => {});
 
   let answer;
   try {
-    answer = await askClaude(question, threadHistory);
+    answer = await askClaude(question);
   } catch (err) {
     console.error('[PROCESS] Claude error:', err.message);
     answer = `Sorry, I ran into an error: ${err.message}`;
