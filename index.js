@@ -382,6 +382,13 @@ Always use tools to fetch actual data — never say you "don't have access".`,
   return 'Reached max iterations — please try a more specific question.';
 }
 
+function trimToAnswer(text) {
+  // Strip any reasoning/narration before the structured answer
+  const match = text.match(/(\*Answer:|Answer:)/);
+  return match ? text.slice(match.index) : text;
+}
+}
+
 // ─── Slack Client ─────────────────────────────────────────────────────────────
 
 function slackRequest(endpoint, payload, token) {
@@ -436,7 +443,7 @@ async function processEvent(event, slackToken) {
 
   let answer;
   try {
-    answer = await askClaude(question);
+    answer = trimToAnswer(await askClaude(question));
   } catch (err) {
     console.error('[PROCESS] Claude error:', err.message);
     answer = `Sorry, I ran into an error: ${err.message}`;
