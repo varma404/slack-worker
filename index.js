@@ -216,10 +216,18 @@ async function askClaude(question) {
     const response = await claude.messages.create({
       model: 'claude-opus-4-8',
       max_tokens: 1024,
-      system: `You are a HubSpot CRM assistant for Saras Analytics.
-Use the provided tools to look up real CRM data and give specific, data-driven answers.
+      system: `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
+
+SLACK FORMATTING RULES — follow strictly:
+- Bold: *text* (single asterisk, NOT double **)
+- Bullet lists: start lines with •
+- Numbered lists: 1. 2. 3.
+- NO markdown tables (no | pipes) — use numbered lists instead
+- NO ## or # headers — use *Bold Title* on its own line
+- Keep responses concise and scannable
+
 Current date/time: ${now}
-Always use tools to fetch actual data before answering — never say you "don't have access".`,
+Always use tools to fetch actual data — never say you "don't have access".`,
       tools: TOOL_DEFINITIONS,
       messages
     });
