@@ -124,6 +124,19 @@ const TOOL_DEFINITIONS = [
     }
   },
   {
+    name: 'get_associations',
+    description: 'Get objects associated with a given HubSpot record (e.g. find the company linked to a deal, or contacts linked to a company). Use this to cross-reference data across object types.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'], description: 'The source object type' },
+        object_id: { type: 'string', description: 'The source object ID' },
+        to_object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'], description: 'The associated object type to fetch' }
+      },
+      required: ['object_type', 'object_id', 'to_object_type']
+    }
+  },
+  {
     name: 'get_contact',
     description: 'Get full details for a specific contact by HubSpot ID.',
     input_schema: {
@@ -260,6 +273,12 @@ async function executeTool(name, input) {
         return { success: true, total: res.results?.length || 0, results: res.results?.map(c => ({ id: c.id, ...c.properties })) };
       }
 
+      case 'get_associations': {
+        const res = await hubspotRequest('GET', `/crm/v3/objects/${input.object_type}/${input.object_id}/associations/${input.to_object_type}`);
+        const ids = (res.results || []).map(r => r.id);
+        return { total: ids.length, ids };
+      }
+
       case 'get_contact': {
         const baseProps = ['firstname', 'lastname', 'email', 'phone', 'company', 'createdate', 'hs_lead_status', 'jobtitle', 'lifecyclestage'];
         const props = [...new Set([...baseProps, ...(input.properties || [])])].join(',');
@@ -296,7 +315,7 @@ async function askClaude(question) {
   const messages = [{ role: 'user', content: question }];
   const now = new Date().toISOString();
 
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 12; i++) {
     const response = await claude.messages.create({
       model: 'claude-opus-4-8',
       max_tokens: 2048,
