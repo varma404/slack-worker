@@ -328,7 +328,14 @@ async function processEvent(event, slackToken) {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  env: {
+    hasHubspot: !!process.env.HUBSPOT_PRIVATE_APP_TOKEN,
+    hasAnthropic: !!process.env.ANTHROPIC_API_KEY,
+    hasSlackToken: !!process.env.SLACK_BOT_TOKEN
+  }
+}));
 
 app.post('/process', async (req, res) => {
   const { event, token } = req.body;
