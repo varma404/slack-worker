@@ -387,7 +387,6 @@ function trimToAnswer(text) {
   const match = text.match(/(\*Answer:|Answer:)/);
   return match ? text.slice(match.index) : text;
 }
-}
 
 // ─── Slack Client ─────────────────────────────────────────────────────────────
 
