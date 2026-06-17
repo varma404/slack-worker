@@ -302,6 +302,10 @@ async function askClaude(question) {
       max_tokens: 2048,
       system: `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
+SARAS ANALYTICS — HUBSPOT PROPERTY MAPPINGS:
+${process.env.HUBSPOT_CONTEXT || '(none configured)'}
+Always use the mapped property name when a user asks about a business term listed above.
+
 SLACK FORMATTING RULES — follow strictly:
 - Bold: *text* (single asterisk, NOT double **)
 - Bullet lists: start lines with •
