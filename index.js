@@ -406,8 +406,43 @@ async function executeTool(name, input) {
 
 // ─── Claude with Tool Use ─────────────────────────────────────────────────────
 
-async function askClaude(question) {
-  const messages = [{ role: 'user', content: question }];
+async function fetchThreadHistory(channel, thread_ts, botUserId, token) {
+  return new Promise((resolve) => {
+    const path = `/api/conversations.replies?channel=${encodeURIComponent(channel)}&ts=${encodeURIComponent(thread_ts)}&limit=20`;
+    const options = {
+      hostname: 'slack.com',
+      port: 443,
+      path,
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` }
+    };
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(body);
+          if (!parsed.ok) { resolve([]); return; }
+          // Build alternating user/assistant messages, skip the current (last) message
+          const msgs = [];
+          const history = (parsed.messages || []).slice(0, -1); // exclude current message
+          for (const m of history) {
+            const isBot = m.bot_id || (botUserId && m.user === botUserId);
+            const text = m.text?.replace(/<@[A-Z0-9]+>/g, '').trim();
+            if (!text) continue;
+            msgs.push({ role: isBot ? 'assistant' : 'user', content: text });
+          }
+          resolve(msgs);
+        } catch { resolve([]); }
+      });
+    });
+    req.on('error', () => resolve([]));
+    req.end();
+  });
+}
+
+async function askClaude(question, history = []) {
+  const messages = [...history, { role: 'user', content: question }];
   const now = new Date().toISOString();
 
   for (let i = 0; i < 20; i++) {
@@ -537,12 +572,20 @@ async function processEvent(event, slackToken) {
 
   console.log('[PROCESS] Question:', question);
 
+  // Fetch thread history for follow-up context (only if this is a reply in a thread)
+  let history = [];
+  if (event.thread_ts && event.thread_ts !== event.ts) {
+    const botUserId = process.env.SLACK_BOT_USER_ID || '';
+    history = await fetchThreadHistory(event.channel, event.thread_ts, botUserId, slackToken);
+    if (history.length > 0) console.log(`[PROCESS] Loaded ${history.length} prior messages from thread`);
+  }
+
   // Hourglass while thinking
   await slackRequest('/reactions.add', { channel: event.channel, timestamp: event.ts, name: 'hourglass_flowing_sand' }, slackToken).catch(() => {});
 
   let answer;
   try {
-    answer = trimToAnswer(await askClaude(question));
+    answer = trimToAnswer(await askClaude(question, history));
   } catch (err) {
     console.error('[PROCESS] Claude error:', err.message);
     answer = `Sorry, I ran into an error: ${err.message}`;
