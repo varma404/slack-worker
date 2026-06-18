@@ -124,6 +124,41 @@ const TOOL_DEFINITIONS = [
     }
   },
   {
+    name: 'get_deals_with_company_properties',
+    description: 'Efficiently fetch deals AND their associated company properties in a single batch operation. Use this for ANY cross-object question involving deals and companies — e.g. "deals where company is ICP", "deals where company revenue > X", "ICP mismatch between deal and company". Far more efficient than fetching associations one-by-one. Returns each deal with its associated company data attached.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_filters: {
+          type: 'array',
+          description: 'Filters for deals — same format as search_objects. Use ISO date strings for dates.',
+          items: {
+            type: 'object',
+            properties: {
+              property: { type: 'string' },
+              operator: { type: 'string', enum: ['EQ', 'NEQ', 'LT', 'LTE', 'GT', 'GTE', 'BETWEEN', 'HAS_PROPERTY', 'NOT_HAS_PROPERTY', 'CONTAINS_TOKEN', 'NOT_CONTAINS_TOKEN'] },
+              value: { type: 'string' },
+              high_value: { type: 'string' }
+            },
+            required: ['property', 'operator']
+          }
+        },
+        deal_properties: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Deal properties to return. Defaults to dealname, dealstage, amount, closedate, createdate.'
+        },
+        company_properties: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Company properties to return for each associated company. Defaults to name, is_the_company_icp_, domain.'
+        },
+        limit: { type: 'integer', description: 'Max deals to fetch (1-100, default 100)', default: 100 }
+      },
+      required: []
+    }
+  },
+  {
     name: 'get_associations',
     description: 'Get objects associated with a given HubSpot record (e.g. find the company linked to a deal, or contacts linked to a company). Use this to cross-reference data across object types.',
     input_schema: {
@@ -273,6 +308,66 @@ async function executeTool(name, input) {
         return { success: true, total: res.results?.length || 0, results: res.results?.map(c => ({ id: c.id, ...c.properties })) };
       }
 
+      case 'get_deals_with_company_properties': {
+        // Step 1: Search deals with filters
+        const filters = (input.deal_filters || []).map(f => {
+          const filter = { propertyName: f.property, operator: f.operator };
+          if (f.value !== undefined) {
+            const v = f.value;
+            filter.value = /^\d{4}-\d{2}-\d{2}/.test(v) ? new Date(v).getTime().toString() : v;
+          }
+          if (f.high_value !== undefined) {
+            filter.highValue = /^\d{4}-\d{2}-\d{2}/.test(f.high_value)
+              ? new Date(f.high_value).getTime().toString() : f.high_value;
+          }
+          return filter;
+        });
+        const dealProps = input.deal_properties?.length
+          ? input.deal_properties
+          : ['dealname', 'dealstage', 'amount', 'closedate', 'createdate'];
+        const dealSearch = await hubspotRequest('POST', '/crm/v3/objects/deals/search', {
+          limit: Math.min(input.limit || 100, 100),
+          properties: dealProps,
+          sorts: [{ propertyName: 'createdate', direction: 'DESCENDING' }],
+          ...(filters.length > 0 ? { filterGroups: [{ filters }] } : {})
+        });
+        const deals = dealSearch.results || [];
+        if (deals.length === 0) return { total: 0, results: [] };
+
+        // Step 2: Batch fetch deal→company associations
+        const assocRes = await hubspotRequest('POST', '/crm/v4/associations/deals/companies/batch/read', {
+          inputs: deals.map(d => ({ id: d.id }))
+        });
+        const dealToCompany = {};
+        for (const result of (assocRes.results || [])) {
+          const companyIds = (result.to || []).map(t => t.toObjectId);
+          if (companyIds.length > 0) dealToCompany[result.from.id] = companyIds[0];
+        }
+        const companyIds = [...new Set(Object.values(dealToCompany))];
+
+        // Step 3: Batch fetch company properties
+        const companyData = {};
+        if (companyIds.length > 0) {
+          const companyProps = input.company_properties?.length
+            ? input.company_properties
+            : ['name', 'is_the_company_icp_', 'domain'];
+          const companyRes = await hubspotRequest('POST', '/crm/v3/objects/companies/batch/read', {
+            inputs: companyIds.map(id => ({ id })),
+            properties: companyProps
+          });
+          for (const c of (companyRes.results || [])) {
+            companyData[c.id] = { id: c.id, ...c.properties };
+          }
+        }
+
+        // Step 4: Merge
+        const results = deals.map(d => ({
+          deal: { id: d.id, ...d.properties },
+          company: dealToCompany[d.id] ? companyData[dealToCompany[d.id]] || null : null
+        }));
+        return { total: deals.length, results };
+      }
+
       case 'get_associations': {
         const res = await hubspotRequest('GET', `/crm/v3/objects/${input.object_type}/${input.object_id}/associations/${input.to_object_type}`);
         const ids = (res.results || []).map(r => r.id);
@@ -315,7 +410,7 @@ async function askClaude(question) {
   const messages = [{ role: 'user', content: question }];
   const now = new Date().toISOString();
 
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 20; i++) {
     const response = await claude.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 4096,
@@ -324,6 +419,11 @@ async function askClaude(question) {
 SARAS ANALYTICS — HUBSPOT PROPERTY MAPPINGS:
 ${process.env.HUBSPOT_CONTEXT || '(none configured)'}
 Always use the mapped property name when a user asks about a business term listed above.
+
+TOOL SELECTION RULES:
+- For ANY question involving BOTH deals AND company properties (ICP status, company name, industry, revenue, etc.) → use get_deals_with_company_properties. This is a single batch call. Do NOT use get_associations one-by-one for this.
+- Use search_objects / search_deals for deal-only queries with no company property filtering.
+- Use get_associations only when you need a one-off relationship lookup for a single record.
 
 RESPONSE RULES:
 - Call all tools silently — zero text output while fetching data
