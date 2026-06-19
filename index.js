@@ -24,6 +24,13 @@ function getCached(key) {
   return e;
 }
 function setCache(key, answer) {
+  if (responseCache.size >= 500) {
+    const cutoff = Date.now() - CACHE_TTL_MS / 2;
+    for (const [k, v] of responseCache) {
+      if (v.ts < cutoff) responseCache.delete(k);
+      if (responseCache.size < 400) break;
+    }
+  }
   responseCache.set(key, { answer, ts: Date.now() });
 }
 
@@ -493,9 +500,14 @@ async function askClaude(question, history = [], statusUpdater = async () => {})
 
   for (let i = 0; i < 20; i++) {
     const response = await claude.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 4096,
-      system: `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
+      // System prompt split: static body is cached (saves ~75% on repeat tool-loop iterations);
+      // dynamic date block is sent uncached so it stays accurate.
+      system: [
+        {
+          type: 'text',
+          text: `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
 ${process.env.BUSINESS_CONTEXT ? `BUSINESS CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}
 SARAS ANALYTICS — HUBSPOT PROPERTY MAPPINGS:
@@ -534,8 +546,14 @@ SLACK FORMATTING RULES — follow strictly:
 - NO markdown tables (no | pipes) — use numbered lists instead
 - NO ## or # headers — use *Bold Title* on its own line
 
-Current date/time: ${now}
 Always use tools to fetch actual data — never say you "don't have access".`,
+          cache_control: { type: 'ephemeral' }
+        },
+        {
+          type: 'text',
+          text: `Current date/time: ${now}`
+        }
+      ],
       tools: TOOL_DEFINITIONS,
       messages
     });
@@ -639,7 +657,7 @@ async function processEvent(event, slackToken) {
         thread_ts: event.thread_ts || event.ts,
         text: cached.answer.slice(0, 200),
         blocks
-      }, slackToken).catch(() => {});
+      }, slackToken).catch(err => console.error('[SLACK] Failed to post cached answer:', err.message));
       return;
     }
   }
@@ -699,7 +717,7 @@ async function processEvent(event, slackToken) {
     await slackRequest('/chat.delete', {
       channel: event.channel,
       ts: statusTs
-    }, slackToken).catch(() => {});
+    }, slackToken).catch(err => console.error('[SLACK] Failed to delete status message:', err.message));
   }
 
   await slackRequest('/chat.postMessage', {
@@ -707,7 +725,7 @@ async function processEvent(event, slackToken) {
     thread_ts: event.thread_ts || event.ts,
     text: answer.slice(0, 200),
     blocks
-  }, slackToken).catch(() => {});
+  }, slackToken).catch(err => console.error('[SLACK] Failed to post answer:', err.message));
 
   // Log question + answer to the designated logging channel (fire-and-forget)
   const logChannel = process.env.LOG_CHANNEL_ID;
