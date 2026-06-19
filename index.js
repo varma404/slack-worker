@@ -51,68 +51,16 @@ let fallbackIdx = 0;
 
 // ─── Table Rendering ──────────────────────────────────────────────────────────
 
-function parseMarkdownTable(text) {
-  const lines = text.trim().split('\n').filter(l => l.trim());
-  if (!lines[0]?.includes('|')) return null;
-
-  const headers = lines[0].split('|').map(s => s.trim()).filter(Boolean);
-  // Skip separator line (---|---), collect data rows
-  const rows = lines.slice(2)
-    .filter(l => l.includes('|'))
-    .map(l => l.split('|').map(s => s.trim()).filter(Boolean));
-
-  if (headers.length === 0 || rows.length === 0) return null;
-  return { headers, rows };
-}
-
-function renderUnicodeTable(headers, rows) {
-  const colWidths = headers.map((h, i) => {
-    const maxData = rows.reduce((max, row) => Math.max(max, (row[i] || '').length), 0);
-    return Math.max(h.length, maxData, 3) + 2;
-  });
-
-  const hr = (l, m, r) => l + colWidths.map(w => '─'.repeat(w)).join(m) + r;
-  const rowStr = (cells) => '│' + headers.map((_, i) => ` ${(cells[i] || '').padEnd(colWidths[i] - 2)} `).join('│') + '│';
-
-  return [
-    hr('┌', '┬', '┐'),
-    rowStr(headers),
-    hr('├', '┼', '┤'),
-    ...rows.map(r => rowStr(r)),
-    hr('└', '┴', '┘'),
-  ].join('\n');
-}
-
 function buildAnswerBlocks(answer) {
   const blocks = [];
-  const segments = answer.split(/(?=TABLE:\n)/);
-
-  for (const segment of segments) {
-    const trimmed = segment.trim();
-    if (!trimmed) continue;
-
-    if (trimmed.startsWith('TABLE:\n')) {
-      const tableMarkdown = trimmed.replace(/^TABLE:\n/, '');
-      const parsed = parseMarkdownTable(tableMarkdown);
-      if (parsed) {
-        const tableStr = renderUnicodeTable(parsed.headers, parsed.rows);
-        blocks.push({
-          type: 'rich_text',
-          elements: [{ type: 'rich_text_preformatted', elements: [{ type: 'text', text: tableStr }] }]
-        });
-      }
-    } else {
-      let remaining = trimmed;
-      while (remaining.length > 2900) {
-        const split = remaining.lastIndexOf('\n', 2900);
-        const cutAt = split > 1000 ? split : 2900;
-        blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining.slice(0, cutAt) } });
-        remaining = remaining.slice(cutAt).trimStart();
-      }
-      if (remaining) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining } });
-    }
+  let remaining = answer;
+  while (remaining.length > 2900) {
+    const split = remaining.lastIndexOf('\n', 2900);
+    const cutAt = split > 1000 ? split : 2900;
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining.slice(0, cutAt) } });
+    remaining = remaining.slice(cutAt).trimStart();
   }
-
+  if (remaining) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining } });
   return blocks;
 }
 
@@ -579,21 +527,11 @@ RESPONSE RULES:
 - Do NOT show ✅ / ❌ per record — only show records that matched
 - If listing matched records, show: name, stage, amount, and any other directly relevant fields — nothing else
 
-TABLE FORMATTING:
-When the answer includes a list of 3 or more records with 2 or more properties, format the data as a markdown table using this exact format — place it after the *Answer:* line:
-
-TABLE:
-| Column1 | Column2 | Column3 |
-|---------|---------|---------|
-| val1    | val2    | val3    |
-
-Only use TABLE: for structured list data. Do NOT use TABLE: for single records, counts, or narrative answers.
-
 SLACK FORMATTING RULES — follow strictly:
 - Bold: *text* (single asterisk, NOT double **)
 - Bullet lists: start lines with •
 - Numbered lists: 1. 2. 3.
-- NO inline markdown tables (no | pipes) outside of TABLE: sections
+- NO markdown tables (no | pipes) — use numbered lists instead
 - NO ## or # headers — use *Bold Title* on its own line
 
 Current date/time: ${now}
@@ -756,30 +694,20 @@ async function processEvent(event, slackToken) {
 
   const blocks = buildAnswerBlocks(answer);
 
-  // Update the status message in-place with the final answer
+  // Delete the status message (removes the "edited" label), then post a clean fresh answer
   if (statusTs) {
-    await slackRequest('/chat.update', {
+    await slackRequest('/chat.delete', {
       channel: event.channel,
-      ts: statusTs,
-      text: answer.slice(0, 200),
-      blocks
-    }, slackToken).catch(async () => {
-      // Fallback: post new message if update fails
-      await slackRequest('/chat.postMessage', {
-        channel: event.channel,
-        thread_ts: event.thread_ts || event.ts,
-        text: answer.slice(0, 200),
-        blocks
-      }, slackToken).catch(() => {});
-    });
-  } else {
-    await slackRequest('/chat.postMessage', {
-      channel: event.channel,
-      thread_ts: event.thread_ts || event.ts,
-      text: answer.slice(0, 200),
-      blocks
+      ts: statusTs
     }, slackToken).catch(() => {});
   }
+
+  await slackRequest('/chat.postMessage', {
+    channel: event.channel,
+    thread_ts: event.thread_ts || event.ts,
+    text: answer.slice(0, 200),
+    blocks
+  }, slackToken).catch(() => {});
 
   console.log('[PROCESS] Done');
 }
