@@ -645,7 +645,8 @@ async function processEvent(event, slackToken) {
 
   // Check cache — skip for thread replies to keep conversation context fresh
   const isThreadReply = event.thread_ts && event.thread_ts !== event.ts;
-  const cacheKey = `${event.channel}:${question.toLowerCase()}`;
+  // Include user ID so "show me my deals" returns per-user results, not a shared answer
+  const cacheKey = `${event.user || ''}:${event.channel}:${question.toLowerCase()}`;
   if (!isThreadReply) {
     const cached = getCached(cacheKey);
     if (cached) {
@@ -754,6 +755,11 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.post('/process', async (req, res) => {
+  const workerSecret = process.env.WORKER_SECRET;
+  if (workerSecret && req.headers['x-worker-secret'] !== workerSecret) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
   const { event, token } = req.body;
   if (!event || !token) return res.status(400).json({ error: 'Missing event or token' });
 
