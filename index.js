@@ -588,7 +588,14 @@ async function processEvent(event, slackToken) {
     answer = trimToAnswer(await askClaude(question, history));
   } catch (err) {
     console.error('[PROCESS] Claude error:', err.message);
-    answer = `Sorry, I ran into an error: ${err.message}`;
+    const raw = err.message || '';
+    const limitMatch = raw.match(/you have reached your specified workspace api usage limits[^]*/i);
+    if (limitMatch) {
+      const detail = raw.match(/You will regain access[^".]*/i);
+      answer = `*API Usage Limit Reached*\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
+    } else {
+      answer = `*Error:* ${raw}`;
+    }
   }
 
   // Split long responses into multiple blocks (Slack limit: 3000 chars per block)
