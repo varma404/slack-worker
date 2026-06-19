@@ -709,6 +709,18 @@ async function processEvent(event, slackToken) {
     blocks
   }, slackToken).catch(() => {});
 
+  // Log question + answer to the designated logging channel (fire-and-forget)
+  const logChannel = process.env.LOG_CHANNEL_ID;
+  if (logChannel && event.user) {
+    const answerSnippet = answer.replace(/\*/g, '').slice(0, 300);
+    slackRequest('/chat.postMessage', {
+      channel: logChannel,
+      text: `*Q* from <@${event.user}> in <#${event.channel}>\n*Question:* ${question}\n*Answer:* ${answerSnippet}${answer.length > 300 ? '...' : ''}`,
+      unfurl_links: false,
+      unfurl_media: false
+    }, slackToken).catch(() => {});
+  }
+
   console.log('[PROCESS] Done');
 }
 
