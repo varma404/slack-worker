@@ -13,6 +13,109 @@ const PORT = process.env.PORT || 3000;
 
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// ─── Response Cache ───────────────────────────────────────────────────────────
+
+const responseCache = new Map();
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function getCached(key) {
+  const e = responseCache.get(key);
+  if (!e || Date.now() - e.ts > CACHE_TTL_MS) { responseCache.delete(key); return null; }
+  return e;
+}
+function setCache(key, answer) {
+  responseCache.set(key, { answer, ts: Date.now() });
+}
+
+// ─── Status Message Phrases ───────────────────────────────────────────────────
+
+const TOOL_STATUS = {
+  get_object_properties: 'Reading the CRM schema...',
+  search_objects: 'Querying the pipeline...',
+  search_contacts: 'Searching for contacts...',
+  search_deals: 'Querying the pipeline...',
+  get_deals_with_company_properties: 'Pulling deals and accounts...',
+  get_associations: 'Connecting the dots...',
+  get_contact: 'Fetching the record...',
+  get_deal: 'Fetching the record...',
+  get_company: 'Fetching the record...',
+};
+
+const FALLBACK_STATUSES = [
+  'Negotiating with HubSpot...',
+  'Herding the data...',
+  'Crunching the numbers...',
+  'Consulting the CRM oracle...',
+];
+let fallbackIdx = 0;
+
+// ─── Table Rendering ──────────────────────────────────────────────────────────
+
+function parseMarkdownTable(text) {
+  const lines = text.trim().split('\n').filter(l => l.trim());
+  if (!lines[0]?.includes('|')) return null;
+
+  const headers = lines[0].split('|').map(s => s.trim()).filter(Boolean);
+  // Skip separator line (---|---), collect data rows
+  const rows = lines.slice(2)
+    .filter(l => l.includes('|'))
+    .map(l => l.split('|').map(s => s.trim()).filter(Boolean));
+
+  if (headers.length === 0 || rows.length === 0) return null;
+  return { headers, rows };
+}
+
+function renderUnicodeTable(headers, rows) {
+  const colWidths = headers.map((h, i) => {
+    const maxData = rows.reduce((max, row) => Math.max(max, (row[i] || '').length), 0);
+    return Math.max(h.length, maxData, 3) + 2;
+  });
+
+  const hr = (l, m, r) => l + colWidths.map(w => '─'.repeat(w)).join(m) + r;
+  const rowStr = (cells) => '│' + headers.map((_, i) => ` ${(cells[i] || '').padEnd(colWidths[i] - 2)} `).join('│') + '│';
+
+  return [
+    hr('┌', '┬', '┐'),
+    rowStr(headers),
+    hr('├', '┼', '┤'),
+    ...rows.map(r => rowStr(r)),
+    hr('└', '┴', '┘'),
+  ].join('\n');
+}
+
+function buildAnswerBlocks(answer) {
+  const blocks = [];
+  const segments = answer.split(/(?=TABLE:\n)/);
+
+  for (const segment of segments) {
+    const trimmed = segment.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith('TABLE:\n')) {
+      const tableMarkdown = trimmed.replace(/^TABLE:\n/, '');
+      const parsed = parseMarkdownTable(tableMarkdown);
+      if (parsed) {
+        const tableStr = renderUnicodeTable(parsed.headers, parsed.rows);
+        blocks.push({
+          type: 'rich_text',
+          elements: [{ type: 'rich_text_preformatted', elements: [{ type: 'text', text: tableStr }] }]
+        });
+      }
+    } else {
+      let remaining = trimmed;
+      while (remaining.length > 2900) {
+        const split = remaining.lastIndexOf('\n', 2900);
+        const cutAt = split > 1000 ? split : 2900;
+        blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining.slice(0, cutAt) } });
+        remaining = remaining.slice(cutAt).trimStart();
+      }
+      if (remaining) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining } });
+    }
+  }
+
+  return blocks;
+}
+
 // ─── HubSpot API Client ───────────────────────────────────────────────────────
 
 function hubspotRequest(method, path, body = null) {
@@ -217,7 +320,6 @@ async function executeTool(name, input) {
 
       case 'get_object_properties': {
         const res = await hubspotRequest('GET', `/crm/v3/properties/${input.object_type}`);
-        // Return name, label, type — skip internal hs_ prefixed calculated fields to keep response small
         const props = (res.results || [])
           .map(p => ({ name: p.name, label: p.label, type: p.type, fieldType: p.fieldType }))
           .sort((a, b) => a.name.localeCompare(b.name));
@@ -225,7 +327,6 @@ async function executeTool(name, input) {
       }
 
       case 'search_objects': {
-        // Auto-convert ISO date strings to HubSpot ms-since-epoch format
         function toHubSpotValue(v) {
           if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v)) {
             return String(new Date(v).getTime());
@@ -309,7 +410,6 @@ async function executeTool(name, input) {
       }
 
       case 'get_deals_with_company_properties': {
-        // Step 1: Search deals with filters
         const filters = (input.deal_filters || []).map(f => {
           const filter = { propertyName: f.property, operator: f.operator };
           if (f.value !== undefined) {
@@ -334,7 +434,6 @@ async function executeTool(name, input) {
         const deals = dealSearch.results || [];
         if (deals.length === 0) return { total: 0, results: [] };
 
-        // Step 2: Batch fetch deal→company associations
         const assocRes = await hubspotRequest('POST', '/crm/v4/associations/deals/companies/batch/read', {
           inputs: deals.map(d => ({ id: d.id }))
         });
@@ -345,7 +444,6 @@ async function executeTool(name, input) {
         }
         const companyIds = [...new Set(Object.values(dealToCompany))];
 
-        // Step 3: Batch fetch company properties
         const companyData = {};
         if (companyIds.length > 0) {
           const companyProps = input.company_properties?.length
@@ -360,7 +458,6 @@ async function executeTool(name, input) {
           }
         }
 
-        // Step 4: Merge
         const results = deals.map(d => ({
           deal: { id: d.id, ...d.properties },
           company: dealToCompany[d.id] ? companyData[dealToCompany[d.id]] || null : null
@@ -423,9 +520,8 @@ async function fetchThreadHistory(channel, thread_ts, botUserId, token) {
         try {
           const parsed = JSON.parse(body);
           if (!parsed.ok) { resolve([]); return; }
-          // Build alternating user/assistant messages, skip the current (last) message
           const msgs = [];
-          const history = (parsed.messages || []).slice(0, -1); // exclude current message
+          const history = (parsed.messages || []).slice(0, -1);
           for (const m of history) {
             const isBot = m.bot_id || (botUserId && m.user === botUserId);
             const text = m.text?.replace(/<@[A-Z0-9]+>/g, '').trim();
@@ -441,9 +537,11 @@ async function fetchThreadHistory(channel, thread_ts, botUserId, token) {
   });
 }
 
-async function askClaude(question, history = []) {
+async function askClaude(question, history = [], statusUpdater = async () => {}) {
   const messages = [...history, { role: 'user', content: question }];
   const now = new Date().toISOString();
+
+  await statusUpdater('Analyzing your request...');
 
   for (let i = 0; i < 20; i++) {
     const response = await claude.messages.create({
@@ -451,9 +549,14 @@ async function askClaude(question, history = []) {
       max_tokens: 4096,
       system: `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
+${process.env.BUSINESS_CONTEXT ? `BUSINESS CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}
 SARAS ANALYTICS — HUBSPOT PROPERTY MAPPINGS:
 ${process.env.HUBSPOT_CONTEXT || '(none configured)'}
 Always use the mapped property name when a user asks about a business term listed above.
+
+SCOPE RESTRICTION:
+You ONLY answer questions about HubSpot CRM data — deals, contacts, companies, pipelines, or Saras's sales and marketing activities.
+If a question is unrelated to HubSpot CRM (e.g. general company strategy, coding help, weather, internal ops tools, personal questions), respond with a brief, professional out-of-scope message. Keep it friendly, 2–3 sentences. Acknowledge what they asked, clarify your scope, and point them to the right place. Do NOT call any tools for out-of-scope questions.
 
 TOOL SELECTION RULES:
 - For ANY question involving BOTH deals AND company properties (ICP status, company name, industry, revenue, etc.) → use get_deals_with_company_properties. This is a single batch call. Do NOT use get_associations one-by-one for this.
@@ -476,11 +579,21 @@ RESPONSE RULES:
 - Do NOT show ✅ / ❌ per record — only show records that matched
 - If listing matched records, show: name, stage, amount, and any other directly relevant fields — nothing else
 
+TABLE FORMATTING:
+When the answer includes a list of 3 or more records with 2 or more properties, format the data as a markdown table using this exact format — place it after the *Answer:* line:
+
+TABLE:
+| Column1 | Column2 | Column3 |
+|---------|---------|---------|
+| val1    | val2    | val3    |
+
+Only use TABLE: for structured list data. Do NOT use TABLE: for single records, counts, or narrative answers.
+
 SLACK FORMATTING RULES — follow strictly:
 - Bold: *text* (single asterisk, NOT double **)
 - Bullet lists: start lines with •
 - Numbered lists: 1. 2. 3.
-- NO markdown tables (no | pipes) — use numbered lists instead
+- NO inline markdown tables (no | pipes) outside of TABLE: sections
 - NO ## or # headers — use *Bold Title* on its own line
 
 Current date/time: ${now}
@@ -490,20 +603,23 @@ Always use tools to fetch actual data — never say you "don't have access".`,
     });
 
     if (response.stop_reason === 'end_turn') {
+      await statusUpdater('Manifesting your answer...');
       const text = response.content.find(b => b.type === 'text');
       return text?.text || 'Done.';
     }
 
     if (response.stop_reason !== 'tool_use') {
+      await statusUpdater('Manifesting your answer...');
       const text = response.content.find(b => b.type === 'text');
       return text?.text || 'Done.';
     }
 
-    // Execute all tool calls
     const toolCalls = response.content.filter(b => b.type === 'tool_use');
     const toolResults = [];
 
     for (const call of toolCalls) {
+      const statusText = TOOL_STATUS[call.name] || FALLBACK_STATUSES[fallbackIdx++ % FALLBACK_STATUSES.length];
+      await statusUpdater(statusText);
       console.log(`[WORKER] Tool call: ${call.name}`, JSON.stringify(call.input));
       const result = await executeTool(call.name, call.input);
       console.log(`[WORKER] Tool result: ${call.name} →`, JSON.stringify(result).slice(0, 200));
@@ -518,7 +634,6 @@ Always use tools to fetch actual data — never say you "don't have access".`,
 }
 
 function trimToAnswer(text) {
-  // Strip any reasoning/narration before the structured answer
   const match = text.match(/(\*Answer:|Answer:)/);
   return match ? text.slice(match.index) : text;
 }
@@ -572,20 +687,58 @@ async function processEvent(event, slackToken) {
 
   console.log('[PROCESS] Question:', question);
 
-  // Fetch thread history for follow-up context (only if this is a reply in a thread)
+  // Check cache — skip for thread replies to keep conversation context fresh
+  const isThreadReply = event.thread_ts && event.thread_ts !== event.ts;
+  const cacheKey = `${event.channel}:${question.toLowerCase()}`;
+  if (!isThreadReply) {
+    const cached = getCached(cacheKey);
+    if (cached) {
+      console.log('[PROCESS] Cache hit');
+      const blocks = buildAnswerBlocks(cached.answer);
+      blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_⚡ Cached result_' }] });
+      await slackRequest('/chat.postMessage', {
+        channel: event.channel,
+        thread_ts: event.thread_ts || event.ts,
+        text: cached.answer.slice(0, 200),
+        blocks
+      }, slackToken).catch(() => {});
+      return;
+    }
+  }
+
+  // Fetch thread history for follow-up context
   let history = [];
-  if (event.thread_ts && event.thread_ts !== event.ts) {
+  if (isThreadReply) {
     const botUserId = process.env.SLACK_BOT_USER_ID || '';
     history = await fetchThreadHistory(event.channel, event.thread_ts, botUserId, slackToken);
     if (history.length > 0) console.log(`[PROCESS] Loaded ${history.length} prior messages from thread`);
   }
 
-  // Hourglass while thinking
-  await slackRequest('/reactions.add', { channel: event.channel, timestamp: event.ts, name: 'hourglass_flowing_sand' }, slackToken).catch(() => {});
+  // Post initial status message and store its ts for in-place updates
+  let statusTs = null;
+  try {
+    const statusMsg = await slackRequest('/chat.postMessage', {
+      channel: event.channel,
+      thread_ts: event.thread_ts || event.ts,
+      text: 'Analyzing your request...'
+    }, slackToken);
+    statusTs = statusMsg.ts;
+  } catch (err) {
+    console.error('[PROCESS] Failed to post status message:', err.message);
+  }
+
+  async function statusUpdater(text) {
+    if (!statusTs) return;
+    await slackRequest('/chat.update', {
+      channel: event.channel,
+      ts: statusTs,
+      text
+    }, slackToken).catch(() => {});
+  }
 
   let answer;
   try {
-    answer = trimToAnswer(await askClaude(question, history));
+    answer = trimToAnswer(await askClaude(question, history, statusUpdater));
   } catch (err) {
     console.error('[PROCESS] Claude error:', err.message);
     const raw = err.message || '';
@@ -598,29 +751,35 @@ async function processEvent(event, slackToken) {
     }
   }
 
-  // Split long responses into multiple blocks (Slack limit: 3000 chars per block)
-  const chunks = [];
-  let remaining = answer;
-  while (remaining.length > 2900) {
-    const split = remaining.lastIndexOf('\n', 2900);
-    const cutAt = split > 1000 ? split : 2900;
-    chunks.push(remaining.slice(0, cutAt));
-    remaining = remaining.slice(cutAt).trimStart();
+  // Cache for non-thread questions
+  if (!isThreadReply) setCache(cacheKey, answer);
+
+  const blocks = buildAnswerBlocks(answer);
+
+  // Update the status message in-place with the final answer
+  if (statusTs) {
+    await slackRequest('/chat.update', {
+      channel: event.channel,
+      ts: statusTs,
+      text: answer.slice(0, 200),
+      blocks
+    }, slackToken).catch(async () => {
+      // Fallback: post new message if update fails
+      await slackRequest('/chat.postMessage', {
+        channel: event.channel,
+        thread_ts: event.thread_ts || event.ts,
+        text: answer.slice(0, 200),
+        blocks
+      }, slackToken).catch(() => {});
+    });
+  } else {
+    await slackRequest('/chat.postMessage', {
+      channel: event.channel,
+      thread_ts: event.thread_ts || event.ts,
+      text: answer.slice(0, 200),
+      blocks
+    }, slackToken).catch(() => {});
   }
-  chunks.push(remaining);
-
-  const blocks = chunks.map(chunk => ({ type: 'section', text: { type: 'mrkdwn', text: chunk } }));
-
-  // Post reply in thread
-  await slackRequest('/chat.postMessage', {
-    channel: event.channel,
-    thread_ts: event.thread_ts || event.ts,
-    text: answer.slice(0, 200),
-    blocks
-  }, slackToken);
-
-  // Remove hourglass
-  await slackRequest('/reactions.remove', { channel: event.channel, timestamp: event.ts, name: 'hourglass_flowing_sand' }, slackToken).catch(() => {});
 
   console.log('[PROCESS] Done');
 }
