@@ -34,6 +34,25 @@ function setCache(key, answer) {
   responseCache.set(key, { answer, ts: Date.now() });
 }
 
+// ─── Conversation Session Cache ──────────────────────────────────────────────
+
+const sessionCache = new Map();
+const SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+function getSession(userId, channel) {
+  const key = `${userId}:${channel}`;
+  const entry = sessionCache.get(key);
+  if (!entry || Date.now() - entry.ts > SESSION_TTL_MS) {
+    sessionCache.delete(key);
+    return [];
+  }
+  return entry.history;
+}
+
+function setSession(userId, channel, history) {
+  sessionCache.set(`${userId}:${channel}`, { history, ts: Date.now() });
+}
+
 // ─── Status Message Phrases ───────────────────────────────────────────────────
 
 const TOOL_STATUS = {
@@ -479,7 +498,18 @@ async function fetchThreadHistory(channel, thread_ts, botUserId, token) {
           const history = (parsed.messages || []).slice(0, -1);
           for (const m of history) {
             const isBot = m.bot_id || (botUserId && m.user === botUserId);
-            const text = m.text?.replace(/<@[A-Z0-9]+>/g, '').trim();
+            let text;
+            if (isBot && m.blocks?.length) {
+              // Extract full answer text from blocks — the `text` field is truncated to 200 chars
+              text = m.blocks
+                .filter(b => b.type === 'section' && b.text?.text)
+                .map(b => b.text.text)
+                .join('\n')
+                .replace(/<@[A-Z0-9]+>/g, '')
+                .trim();
+            } else {
+              text = m.text?.replace(/<@[A-Z0-9]+>/g, '').trim();
+            }
             if (!text) continue;
             msgs.push({ role: isBot ? 'assistant' : 'user', content: text });
           }
@@ -643,11 +673,23 @@ async function processEvent(event, slackToken) {
 
   console.log('[PROCESS] Question:', question);
 
-  // Check cache — skip for thread replies to keep conversation context fresh
   const isThreadReply = event.thread_ts && event.thread_ts !== event.ts;
   // Include user ID so "show me my deals" returns per-user results, not a shared answer
   const cacheKey = `${event.user || ''}:${event.channel}:${question.toLowerCase()}`;
-  if (!isThreadReply) {
+
+  // Load conversation history: in-memory session cache first (works for new @mentions AND thread
+  // replies), fall back to fetching from the Slack thread when the session cache is cold.
+  let history = event.user ? getSession(event.user, event.channel) : [];
+  if (history.length === 0 && isThreadReply) {
+    const botUserId = process.env.SLACK_BOT_USER_ID || '';
+    history = await fetchThreadHistory(event.channel, event.thread_ts, botUserId, slackToken);
+  }
+  if (history.length > 0) console.log(`[PROCESS] Loaded ${history.length} prior messages as context`);
+
+  const hasHistory = history.length > 0;
+
+  // Skip response cache for context-aware follow-ups (answers depend on prior exchange)
+  if (!hasHistory) {
     const cached = getCached(cacheKey);
     if (cached) {
       console.log('[PROCESS] Cache hit');
@@ -661,14 +703,6 @@ async function processEvent(event, slackToken) {
       }, slackToken).catch(err => console.error('[SLACK] Failed to post cached answer:', err.message));
       return;
     }
-  }
-
-  // Fetch thread history for follow-up context
-  let history = [];
-  if (isThreadReply) {
-    const botUserId = process.env.SLACK_BOT_USER_ID || '';
-    history = await fetchThreadHistory(event.channel, event.thread_ts, botUserId, slackToken);
-    if (history.length > 0) console.log(`[PROCESS] Loaded ${history.length} prior messages from thread`);
   }
 
   // Post initial status message and store its ts for in-place updates
@@ -708,8 +742,12 @@ async function processEvent(event, slackToken) {
     }
   }
 
-  // Cache for non-thread questions
-  if (!isThreadReply) setCache(cacheKey, answer);
+  // Cache fresh (no-history) questions; update session for all (enables follow-ups in next 15 min)
+  if (!hasHistory) setCache(cacheKey, answer);
+  if (event.user) {
+    const newHistory = [...history, { role: 'user', content: question }, { role: 'assistant', content: answer }];
+    setSession(event.user, event.channel, newHistory.slice(-10)); // Keep last 5 exchanges
+  }
 
   const blocks = buildAnswerBlocks(answer);
 
