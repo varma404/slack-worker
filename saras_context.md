@@ -59,7 +59,7 @@ When a user uses natural language terms, map them as follows. The **Do NOT** rul
 | "revenue" / "annual revenue" / "estimated yearly sales" / "yearly sales" | `estimated_yearly_sales__2025_` | Company | `amount`, `revenue`, `annual_revenue` |
 | "source" / "source 1" / "standard source 1" / "original source" | `standard_source_1` | Company | `source_1`, `hs_analytics_source` |
 | "deal source" / "how the deal came in" | `deal_source` | Deal | `standard_source_1`, `source_1` |
-| "MQL" / "marketing qualified lead" | `mql_date` IS NOT NULL (`HAS_PROPERTY`) | Company | **Do NOT** filter by `lifecyclestage = 'marketingqualifiedlead'` — that stage triggers `mql_date` but is not the source of truth |
+| "MQL" / "marketing qualified lead" / "MQLs" | `mql_date` IS NOT NULL (`HAS_PROPERTY`) | **Company only** — always query the Company object, never Contact | **Do NOT** filter by `lifecyclestage = 'marketingqualifiedlead'` — that stage triggers `mql_date` but is not the source of truth |
 | "ICP" / "ICP company" | `is_the_company_icp_` = `Yes` | Company | **Do NOT** use `icp`, `hs_ideal_customer_profile`, or any other field — only `is_the_company_icp_` is authoritative |
 | "ICP contact" | `is_the_company_icp` = `Yes` | Contact | Note: one fewer trailing underscore than the Company version |
 | "ICP deal" | `is_the_company_icp__` = `Yes` | Deal | Note: two trailing underscores |
