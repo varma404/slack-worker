@@ -57,7 +57,8 @@ If a question is unrelated to HubSpot CRM (e.g. general company strategy, coding
 TOOL SELECTION RULES:
 - For "how many" / count questions, use count_objects — it returns exact totals without fetching records. For breakdowns by time period, call count_objects once per period.
 - For ANY question involving BOTH deals AND company properties (ICP status, company name, industry, revenue, etc.) → use get_deals_with_company_properties. This is a single batch call. Do NOT use get_associations one-by-one for this.
-- Use search_objects for deal-only queries with no company property filtering.
+- For ANY question involving contacts WITH company properties (ICP status, company name, revenue) → use get_contacts_with_company_properties. Same batch pattern.
+- Use search_objects for single-object queries with no cross-object property filtering.
 - Use get_associations only when you need a one-off relationship lookup for a single record.
 - NEVER use the BETWEEN operator for ANY range query (dates, numbers, revenue, etc.) — it is unreliable on HubSpot properties. Instead, use two separate filters: GTE for the lower bound and LTE for the upper bound.
 - For multi-value matching (e.g. country = US or CA or UK), use the IN operator with comma-separated values: { property: "country", operator: "IN", value: "United States,Canada,United Kingdom" }. Use full property values as stored in HubSpot.
@@ -65,6 +66,28 @@ TOOL SELECTION RULES:
 - If a search returns 0 results and the user expected data, re-check your filters: verify the property name with get_object_properties, confirm you used GTE+LTE (not BETWEEN), and make sure you searched the correct object type (Company for MQLs, not Contact).
 - When a search returns truncated: true and after is not null, you CAN call the same tool with the after cursor to get the next page — but only if the user's question requires all records. For counts, use count_objects instead.
 - If a tool response includes "truncated": true, tell the user the exact total count and that you're showing a subset. Suggest narrowing filters if the total is large.
+
+COMPLEX QUERY PATTERNS:
+
+"Moved past [stage]" / "after [stage]":
+The Sales Pipeline stage order is: Objective Win → Functional Win → Value Win → Commercial Win → Legal Win → Closed Won.
+"Moved past Objective Win" means the deal's current dealstage is any stage AFTER Objective Win: qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon.
+Use the IN operator with all stages past the named one. Do NOT include closedlost, MQO, DQ, Sales Nurture, or Dead/Duplicate — those are exit paths, not progression.
+
+Cross-object contact + company questions:
+For questions needing contact details WITH company properties (name, ICP, revenue), use get_contacts_with_company_properties. This handles the batch lookup in one call.
+Example: "CXOs at ICP companies" → get_contacts_with_company_properties with jobtitle filter + request company is_the_company_icp_ property, then filter results where company.is_the_company_icp_ = Yes.
+
+CXO / C-level title search:
+HubSpot jobtitle is a free-text field. To find C-level contacts, search with CONTAINS_TOKEN for "Chief" — this catches CEO, CFO, CTO, CMO, COO, and other Chief titles in one query. If you need specific titles only, make separate searches per title and deduplicate by contact ID.
+
+Ratio / comparison questions:
+For "X vs Y ratio" or "X vs Y trend", make count_objects calls for each category per time period. Present results as a numbered list with both counts and the calculated ratio/percentage.
+
+"Revenue" in deal vs company context:
+- "Deal value" / "deal amount" / "ARR" → amount on Deal
+- "Company revenue" / "annual revenue" / "revenue" when filtering companies → estimated_yearly_sales__2025_ on Company
+- If a question says "deals with revenue < $X" without specifying deal or company, default to company revenue (estimated_yearly_sales__2025_) via get_deals_with_company_properties unless the user specifically says "deal amount".
 
 RESPONSE RULES:
 - Call all tools silently — zero text output while fetching data
@@ -178,10 +201,36 @@ function getThreadMessages(threadKey) {
   return entry.messages;
 }
 
+function compressHistory(messages) {
+  return messages.map((msg, i) => {
+    if (i >= messages.length - 4) return msg;
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      return {
+        role: 'user',
+        content: msg.content.map(block => {
+          if (block.type === 'tool_result') {
+            try {
+              const parsed = JSON.parse(block.content);
+              const summary = { total: parsed.total };
+              if (parsed.returned !== undefined) summary.returned = parsed.returned;
+              if (parsed.truncated) summary.truncated = true;
+              if (parsed.error) summary.error = parsed.error;
+              return { ...block, content: JSON.stringify(summary) };
+            } catch { return block; }
+          }
+          return block;
+        })
+      };
+    }
+    return msg;
+  });
+}
+
 function storeThreadMessages(threadKey, messages) {
-  const trimmed = messages.length > MAX_HISTORY_MESSAGES
-    ? messages.slice(-MAX_HISTORY_MESSAGES)
-    : messages;
+  const compressed = compressHistory(messages);
+  const trimmed = compressed.length > MAX_HISTORY_MESSAGES
+    ? compressed.slice(-MAX_HISTORY_MESSAGES)
+    : compressed;
   threadHistory.set(threadKey, { messages: trimmed, ts: Date.now() });
 }
 
@@ -205,6 +254,7 @@ const TOOL_STATUS = {
   get_object_properties: 'Reading the CRM schema...',
   search_objects: 'Querying the pipeline...',
   get_deals_with_company_properties: 'Pulling deals and accounts...',
+  get_contacts_with_company_properties: 'Pulling contacts and accounts...',
   get_associations: 'Connecting the dots...',
   get_contact: 'Fetching the record...',
   get_deal: 'Fetching the record...',
@@ -267,6 +317,7 @@ function slackRequest(endpoint, payload, token) {
       });
     });
     req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Slack timeout')); });
     req.write(data);
     req.end();
   });
@@ -285,7 +336,7 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
   const messages = [...history, { role: 'user', content: question }];
 
   let iterations = 0;
-  while (iterations++ < 15) {
+  while (iterations++ < 25) {
     const response = await anthropic.messages.create({
       model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 16000,
@@ -348,6 +399,12 @@ async function processEvent(event, slackToken) {
   console.log('[PROCESS] Question:', question);
 
   const threadKey = getThreadKey(event);
+
+  slackRequest('/reactions.add', {
+    channel: event.channel,
+    timestamp: event.ts,
+    name: 'eyes'
+  }, slackToken).catch(() => {});
 
   await withThreadLock(threadKey, async () => {
     const hasHistory = getThreadMessages(threadKey).length > 0;
@@ -429,6 +486,9 @@ async function processEvent(event, slackToken) {
         text: 'Sorry, I had trouble formatting that response. Please try rephrasing your question.'
       }, slackToken).catch(() => {});
     });
+
+    slackRequest('/reactions.remove', { channel: event.channel, timestamp: event.ts, name: 'eyes' }, slackToken).catch(() => {});
+    slackRequest('/reactions.add', { channel: event.channel, timestamp: event.ts, name: 'white_check_mark' }, slackToken).catch(() => {});
 
     const logChannel = process.env.LOG_CHANNEL_ID;
     if (logChannel && event.user) {

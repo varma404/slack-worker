@@ -4,9 +4,6 @@
  * Exposes all HubSpot CRM tools for the Claude Agent SDK to consume.
  */
 
-const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
-const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
-const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 const https = require('https');
 
 // ─── HubSpot API Client ───────────────────────────────────────────────────────
@@ -65,7 +62,9 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'], description: 'The CRM object type' }
+        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'], description: 'The CRM object type' },
+        query: { type: 'string', description: 'Optional search term to filter properties by name or label.' },
+        include_internal: { type: 'boolean', description: 'Include HubSpot internal (hs_) properties. Default false.', default: false }
       },
       required: ['object_type']
     }
@@ -177,6 +176,34 @@ const TOOLS = [
     }
   },
   {
+    name: 'get_contacts_with_company_properties',
+    description: 'Fetch contacts AND their associated company properties in a single batch. Use for questions involving contacts with company-level filters (ICP, revenue, industry) or when you need company name/details alongside contact records. Examples: "CXOs at ICP companies", "contacts spoken to at companies with revenue > $X".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contact_filters: {
+          type: 'array',
+          description: 'Filters for contacts — all AND\'d together',
+          items: {
+            type: 'object',
+            properties: {
+              property: { type: 'string' },
+              operator: { type: 'string', enum: ['EQ', 'NEQ', 'LT', 'LTE', 'GT', 'GTE', 'IN', 'HAS_PROPERTY', 'NOT_HAS_PROPERTY', 'CONTAINS_TOKEN', 'NOT_CONTAINS_TOKEN'] },
+              value: { type: 'string' },
+              high_value: { type: 'string' }
+            },
+            required: ['property', 'operator']
+          }
+        },
+        contact_properties: { type: 'array', items: { type: 'string' }, description: 'Contact properties to return.' },
+        company_properties: { type: 'array', items: { type: 'string' }, description: 'Company properties to return for each contact\'s associated company.' },
+        limit: { type: 'integer', description: 'Max results 1-100 (default 100)', default: 100 },
+        after: { type: 'string', description: 'Pagination cursor from a previous response.' }
+      },
+      required: []
+    }
+  },
+  {
     name: 'count_objects',
     description: 'Get the exact count of objects matching filters WITHOUT returning records. Use for any "how many" question or monthly/periodic breakdown. Returns the accurate total from HubSpot (not capped at 100). Much faster than search_objects when you only need a number.',
     inputSchema: {
@@ -211,9 +238,16 @@ async function executeTool(name, input) {
 
       case 'get_object_properties': {
         const res = await hubspotRequest('GET', `/crm/v3/properties/${input.object_type}`);
-        const props = (res.results || [])
-          .map(p => ({ name: p.name, label: p.label, type: p.type, fieldType: p.fieldType }))
-          .sort((a, b) => a.name.localeCompare(b.name));
+        let props = (res.results || [])
+          .map(p => ({ name: p.name, label: p.label, type: p.type, fieldType: p.fieldType }));
+        if (!input.include_internal) {
+          props = props.filter(p => !p.name.startsWith('hs_'));
+        }
+        if (input.query) {
+          const q = input.query.toLowerCase();
+          props = props.filter(p => p.name.includes(q) || p.label.toLowerCase().includes(q));
+        }
+        props.sort((a, b) => a.name.localeCompare(b.name));
         return { total: props.length, properties: props };
       }
 
@@ -307,6 +341,62 @@ async function executeTool(name, input) {
         };
       }
 
+      case 'get_contacts_with_company_properties': {
+        const filters = (input.contact_filters || []).map(f => ({
+          propertyName: f.property,
+          operator: f.operator,
+          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
+          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
+        }));
+        const contactProps = input.contact_properties?.length
+          ? input.contact_properties
+          : ['firstname', 'lastname', 'email', 'jobtitle', 'createdate', 'hs_linkedin_url'];
+        const contactSearch = await hubspotRequest('POST', '/crm/v3/objects/contacts/search', {
+          limit: Math.min(input.limit || 100, 100),
+          properties: contactProps,
+          sorts: [{ propertyName: 'createdate', direction: 'DESCENDING' }],
+          ...(filters.length > 0 ? { filterGroups: [{ filters }] } : {}),
+          ...(input.after ? { after: input.after } : {})
+        });
+        const contacts = contactSearch.results || [];
+        if (contacts.length === 0) return { total: 0, results: [] };
+
+        const assocRes = await hubspotRequest('POST', '/crm/v4/associations/contacts/companies/batch/read', {
+          inputs: contacts.map(c => ({ id: c.id }))
+        });
+        const contactToCompany = {};
+        for (const result of (assocRes.results || [])) {
+          const companyIds = (result.to || []).map(t => t.toObjectId);
+          if (companyIds.length > 0) contactToCompany[result.from.id] = companyIds[0];
+        }
+        const companyIds = [...new Set(Object.values(contactToCompany))];
+
+        const companyData = {};
+        if (companyIds.length > 0) {
+          const companyProps = input.company_properties?.length
+            ? input.company_properties
+            : ['name', 'is_the_company_icp_', 'domain'];
+          const companyRes = await hubspotRequest('POST', '/crm/v3/objects/companies/batch/read', {
+            inputs: companyIds.map(id => ({ id })),
+            properties: companyProps
+          });
+          for (const c of (companyRes.results || [])) {
+            companyData[c.id] = { id: c.id, ...c.properties };
+          }
+        }
+
+        return {
+          total: contactSearch.total || contacts.length,
+          returned: contacts.length,
+          truncated: (contactSearch.total || 0) > contacts.length,
+          after: contactSearch.paging?.next?.after || null,
+          results: contacts.map(c => ({
+            contact: { id: c.id, ...c.properties },
+            company: contactToCompany[c.id] ? companyData[contactToCompany[c.id]] || null : null
+          }))
+        };
+      }
+
       case 'get_associations': {
         const res = await hubspotRequest('GET', `/crm/v3/objects/${input.object_type}/${input.object_id}/associations/${input.to_object_type}`);
         return { total: (res.results || []).length, ids: (res.results || []).map(r => r.id) };
@@ -358,25 +448,29 @@ async function executeTool(name, input) {
   }
 }
 
-// ─── MCP Server ───────────────────────────────────────────────────────────────
-
-const server = new Server(
-  { name: 'hubspot', version: '1.0.0' },
-  { capabilities: { tools: {} } }
-);
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
-
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  const result = await executeTool(name, args || {});
-  return {
-    content: [{ type: 'text', text: JSON.stringify(result) }],
-    isError: !!result.error
-  };
-});
+// ─── MCP Server (only when run directly) ────────────────────────────────────
 
 if (require.main === module) {
+  const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
+  const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
+  const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
+
+  const server = new Server(
+    { name: 'hubspot', version: '1.0.0' },
+    { capabilities: { tools: {} } }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const result = await executeTool(name, args || {});
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result) }],
+      isError: !!result.error
+    };
+  });
+
   const transport = new StdioServerTransport();
   server.connect(transport).catch(err => {
     process.stderr.write(`[MCP] Failed to start: ${err.message}\n`);
