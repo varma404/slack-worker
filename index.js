@@ -1,20 +1,22 @@
 /**
- * Slack Worker - HubSpot CRM assistant powered by Claude Agent SDK
+ * Slack Worker - HubSpot CRM assistant powered by Claude API
  */
 
 const express = require('express');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
-const { query } = require('@anthropic-ai/claude-agent-sdk');
+const Anthropic = require('@anthropic-ai/sdk');
 const { App } = require('@slack/bolt');
+const { TOOLS: MCP_TOOLS, executeTool } = require('./hubspot-mcp-server');
 
-// ─── System Prompt (CLAUDE.md) ────────────────────────────────────────────────
-// Written at startup so query() picks it up via cwd: __dirname
+// ─── Claude Client & System Prompt ──────────────────────────────────────────
+
+const anthropic = new Anthropic();
 
 const SARAS_CONTEXT = fs.readFileSync(path.join(__dirname, 'saras_context.md'), 'utf8');
 
-const CLAUDE_MD = `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
+const SYSTEM_PROMPT = `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
 ${SARAS_CONTEXT}
 ${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}
@@ -52,8 +54,12 @@ SLACK FORMATTING RULES — follow strictly:
 
 Always use tools to fetch actual data — never say you "don't have access".`;
 
-fs.writeFileSync(path.join(__dirname, 'CLAUDE.md'), CLAUDE_MD);
-console.log('[WORKER] CLAUDE.md written');
+// Convert MCP tool format to Anthropic API format
+const anthropicTools = MCP_TOOLS.map(t => ({
+  name: t.name,
+  description: t.description,
+  input_schema: t.inputSchema,
+}));
 
 // ─── Express App ──────────────────────────────────────────────────────────────
 
@@ -82,30 +88,32 @@ function setCache(key, answer) {
   responseCache.set(key, { answer, ts: Date.now() });
 }
 
-// ─── Thread Session Store ─────────────────────────────────────────────────────
-// Maps thread keys to Agent SDK session IDs for persistent context across messages.
+// ─── Thread History Store ────────────────────────────────────────────────────
+// Stores conversation messages per thread for follow-up context.
 
-const threadSessions = new Map();
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const threadHistory = new Map();
+const HISTORY_TTL_MS = 30 * 60 * 1000;
+const MAX_HISTORY_MESSAGES = 40;
 
 function getThreadKey(event) {
-  // Thread reply: key on the thread root so all replies share a session
   if (event.thread_ts) return `${event.channel}:${event.thread_ts}`;
-  // DM or top-level mention: key on user+channel so DMs stay isolated per user
   return `${event.channel}:${event.user || event.ts}`;
 }
 
-function getSessionId(threadKey) {
-  const entry = threadSessions.get(threadKey);
-  if (!entry || Date.now() - entry.ts > SESSION_TTL_MS) {
-    threadSessions.delete(threadKey);
-    return null;
+function getThreadMessages(threadKey) {
+  const entry = threadHistory.get(threadKey);
+  if (!entry || Date.now() - entry.ts > HISTORY_TTL_MS) {
+    threadHistory.delete(threadKey);
+    return [];
   }
-  return entry.id;
+  return entry.messages;
 }
 
-function storeSessionId(threadKey, sessionId) {
-  threadSessions.set(threadKey, { id: sessionId, ts: Date.now() });
+function storeThreadMessages(threadKey, messages) {
+  const trimmed = messages.length > MAX_HISTORY_MESSAGES
+    ? messages.slice(-MAX_HISTORY_MESSAGES)
+    : messages;
+  threadHistory.set(threadKey, { messages: trimmed, ts: Date.now() });
 }
 
 // ─── Status Message Phrases ───────────────────────────────────────────────────
@@ -178,81 +186,50 @@ function slackRequest(endpoint, payload, token) {
   });
 }
 
-// ─── Claude via Agent SDK ─────────────────────────────────────────────────────
+// ─── Claude via Anthropic SDK ────────────────────────────────────────────────
 
 async function askClaude(question, threadKey, statusUpdater = async () => {}) {
   await statusUpdater('Analyzing your request...');
 
-  const sessionId = getSessionId(threadKey);
-  if (sessionId) console.log(`[CLAUDE] Resuming session ${sessionId} for ${threadKey}`);
-  else console.log(`[CLAUDE] New session for ${threadKey}`);
+  const history = getThreadMessages(threadKey);
+  const hasHistory = history.length > 0;
+  if (hasHistory) console.log(`[CLAUDE] Resuming thread ${threadKey} (${history.length} messages)`);
+  else console.log(`[CLAUDE] New thread ${threadKey}`);
 
-  const options = {
-    cwd: __dirname,
-    permissionMode: 'bypassPermissions',
-    allowedTools: [
-      'mcp__hubspot__get_object_properties',
-      'mcp__hubspot__search_objects',
-      'mcp__hubspot__search_contacts',
-      'mcp__hubspot__search_deals',
-      'mcp__hubspot__get_deals_with_company_properties',
-      'mcp__hubspot__get_associations',
-      'mcp__hubspot__get_contact',
-      'mcp__hubspot__get_deal',
-      'mcp__hubspot__get_company'
-    ],
-    mcpServers: {
-      hubspot: {
-        command: 'node',
-        args: [path.join(__dirname, 'hubspot-mcp-server.js')],
-        env: { HUBSPOT_PRIVATE_APP_TOKEN: process.env.HUBSPOT_PRIVATE_APP_TOKEN }
-      }
-    },
-    ...(sessionId ? { resume: sessionId } : {})
-  };
+  const messages = [...history, { role: 'user', content: question }];
 
-  let answer = null;
+  let iterations = 0;
+  while (iterations++ < 15) {
+    const response = await anthropic.messages.create({
+      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
+      max_tokens: 4096,
+      system: SYSTEM_PROMPT,
+      tools: anthropicTools,
+      messages,
+    });
 
-  try {
-    for await (const message of query({ prompt: question, options })) {
-      // Capture session ID from init message for thread continuity
-      if (message.type === 'system' && message.subtype === 'init') {
-        const sid = message.session_id || message.data?.session_id;
-        if (sid) {
-          storeSessionId(threadKey, sid);
-          console.log(`[CLAUDE] Session ${sid} stored`);
-        }
-      }
+    messages.push({ role: 'assistant', content: response.content });
 
-      // Update status when Claude calls a HubSpot tool
-      if (message.type === 'assistant') {
-        const content = Array.isArray(message.message?.content) ? message.message.content : [];
-        for (const block of content) {
-          if (block.type === 'tool_use') {
-            const shortName = block.name.replace('mcp__hubspot__', '');
-            const statusText = TOOL_STATUS[shortName] || FALLBACK_STATUSES[fallbackIdx++ % FALLBACK_STATUSES.length];
-            console.log(`[CLAUDE] Tool: ${block.name}`);
-            await statusUpdater(statusText);
-          }
-        }
-      }
-
-      // Final answer
-      if (message.type === 'result') {
-        answer = message.result;
-      }
+    const toolBlocks = response.content.filter(b => b.type === 'tool_use');
+    if (response.stop_reason === 'end_turn' || toolBlocks.length === 0) {
+      storeThreadMessages(threadKey, messages);
+      const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+      return text || 'No response generated.';
     }
-  } catch (err) {
-    // If session resume fails (e.g. session file gone after Railway restart), retry fresh
-    if (sessionId && (err.message?.includes('session') || err.message?.includes('resume') || err.message?.includes('not found'))) {
-      console.warn(`[CLAUDE] Session resume failed (${err.message}), retrying fresh`);
-      threadSessions.delete(threadKey);
-      return askClaude(question, threadKey, statusUpdater);
+
+    const toolResults = [];
+    for (const block of toolBlocks) {
+      const statusText = TOOL_STATUS[block.name] || FALLBACK_STATUSES[fallbackIdx++ % FALLBACK_STATUSES.length];
+      console.log(`[CLAUDE] Tool: ${block.name}`);
+      await statusUpdater(statusText);
+      const result = await executeTool(block.name, block.input);
+      toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
     }
-    throw err;
+    messages.push({ role: 'user', content: toolResults });
   }
 
-  return answer || 'No response received.';
+  storeThreadMessages(threadKey, messages);
+  return 'Reached maximum iterations — try a more specific question.';
 }
 
 function trimToAnswer(text) {
@@ -275,11 +252,10 @@ async function processEvent(event, slackToken) {
   console.log('[PROCESS] Question:', question);
 
   const threadKey = getThreadKey(event);
-  const hasSession = !!getSessionId(threadKey);
+  const hasHistory = getThreadMessages(threadKey).length > 0;
 
-  // Skip response cache for context-aware follow-ups (their answer depends on thread history)
   const cacheKey = `${event.user || ''}:${event.channel}:${question.toLowerCase()}`;
-  if (!hasSession) {
+  if (!hasHistory) {
     const cached = getCached(cacheKey);
     if (cached) {
       console.log('[PROCESS] Cache hit');
@@ -295,7 +271,6 @@ async function processEvent(event, slackToken) {
     }
   }
 
-  // Post status message
   let statusTs = null;
   try {
     const statusMsg = await slackRequest('/chat.postMessage', {
@@ -332,8 +307,7 @@ async function processEvent(event, slackToken) {
     }
   }
 
-  // Cache fresh questions (no active session = standalone query)
-  if (!hasSession) setCache(cacheKey, answer);
+  if (!hasHistory) setCache(cacheKey, answer);
 
   const blocks = buildAnswerBlocks(answer);
 
@@ -351,7 +325,6 @@ async function processEvent(event, slackToken) {
     blocks
   }, slackToken).catch(err => console.error('[SLACK] Failed to post answer:', err.message));
 
-  // Log Q+A to logging channel (fire-and-forget)
   const logChannel = process.env.LOG_CHANNEL_ID;
   if (logChannel && event.user) {
     const answerSnippet = answer.replace(/\*/g, '').slice(0, 300);
@@ -394,29 +367,27 @@ app.post('/process', async (req, res) => {
 app.listen(PORT, () => console.log(`[WORKER] Listening on port ${PORT}`));
 
 // ─── Slack Socket Mode (bolt) ─────────────────────────────────────────────────
-// Only starts when SLACK_APP_TOKEN is set. Without it, Vercel webhook handles
-// incoming events — making the token the single kill switch for rollback.
-
-const slackApp = new App({
-  token: process.env.SLACK_BOT_TOKEN,
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-  socketMode: true,
-  appToken: process.env.SLACK_APP_TOKEN,
-});
-
-slackApp.event('app_mention', async ({ event }) => {
-  await processEvent(event, process.env.SLACK_BOT_TOKEN)
-    .catch(err => console.error('[BOLT] app_mention error:', err.message));
-});
-
-slackApp.event('message', async ({ event }) => {
-  if (event.channel_type === 'im' && !event.bot_id && !event.subtype) {
-    await processEvent(event, process.env.SLACK_BOT_TOKEN)
-      .catch(err => console.error('[BOLT] message error:', err.message));
-  }
-});
 
 if (process.env.SLACK_APP_TOKEN) {
+  const slackApp = new App({
+    token: process.env.SLACK_BOT_TOKEN,
+    signingSecret: process.env.SLACK_SIGNING_SECRET,
+    socketMode: true,
+    appToken: process.env.SLACK_APP_TOKEN,
+  });
+
+  slackApp.event('app_mention', async ({ event }) => {
+    await processEvent(event, process.env.SLACK_BOT_TOKEN)
+      .catch(err => console.error('[BOLT] app_mention error:', err.message));
+  });
+
+  slackApp.event('message', async ({ event }) => {
+    if (event.channel_type === 'im' && !event.bot_id && !event.subtype) {
+      await processEvent(event, process.env.SLACK_BOT_TOKEN)
+        .catch(err => console.error('[BOLT] message error:', err.message));
+    }
+  });
+
   slackApp.start()
     .then(() => console.log('[WORKER] Socket Mode active'))
     .catch(err => console.error('[WORKER] Socket Mode failed to start:', err.message));

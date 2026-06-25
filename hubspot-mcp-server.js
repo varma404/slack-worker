@@ -381,8 +381,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   };
 });
 
-const transport = new StdioServerTransport();
-server.connect(transport).catch(err => {
-  process.stderr.write(`[MCP] Failed to start: ${err.message}\n`);
-  process.exit(1);
-});
+if (require.main === module) {
+  const transport = new StdioServerTransport();
+  server.connect(transport).catch(err => {
+    process.stderr.write(`[MCP] Failed to start: ${err.message}\n`);
+    process.exit(1);
+  });
+}
+
+module.exports = { TOOLS, executeTool };
