@@ -7,6 +7,7 @@ const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const { query } = require('@anthropic-ai/claude-agent-sdk');
+const { App } = require('@slack/bolt');
 
 // ─── System Prompt (CLAUDE.md) ────────────────────────────────────────────────
 // Written at startup so query() picks it up via cwd: __dirname
@@ -391,3 +392,34 @@ app.post('/process', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`[WORKER] Listening on port ${PORT}`));
+
+// ─── Slack Socket Mode (bolt) ─────────────────────────────────────────────────
+// Only starts when SLACK_APP_TOKEN is set. Without it, Vercel webhook handles
+// incoming events — making the token the single kill switch for rollback.
+
+const slackApp = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  socketMode: true,
+  appToken: process.env.SLACK_APP_TOKEN,
+});
+
+slackApp.event('app_mention', async ({ event }) => {
+  await processEvent(event, process.env.SLACK_BOT_TOKEN)
+    .catch(err => console.error('[BOLT] app_mention error:', err.message));
+});
+
+slackApp.event('message', async ({ event }) => {
+  if (event.channel_type === 'im' && !event.bot_id && !event.subtype) {
+    await processEvent(event, process.env.SLACK_BOT_TOKEN)
+      .catch(err => console.error('[BOLT] message error:', err.message));
+  }
+});
+
+if (process.env.SLACK_APP_TOKEN) {
+  slackApp.start()
+    .then(() => console.log('[WORKER] Socket Mode active'))
+    .catch(err => console.error('[WORKER] Socket Mode failed to start:', err.message));
+} else {
+  console.log('[WORKER] No SLACK_APP_TOKEN — Socket Mode disabled, using Vercel webhook');
+}
