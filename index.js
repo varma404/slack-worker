@@ -4,7 +4,11 @@
 
 const express = require('express');
 const https = require('https');
+const path = require('path');
+const fs = require('fs');
 const Anthropic = require('@anthropic-ai/sdk');
+
+const SARAS_CONTEXT = fs.readFileSync(path.join(__dirname, 'saras_context.md'), 'utf8');
 
 const app = express();
 app.use(express.json());
@@ -539,11 +543,8 @@ async function askClaude(question, history = [], statusUpdater = async () => {})
           type: 'text',
           text: `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
-${process.env.BUSINESS_CONTEXT ? `BUSINESS CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}
-SARAS ANALYTICS — HUBSPOT PROPERTY MAPPINGS:
-${process.env.HUBSPOT_CONTEXT || '(none configured)'}
-Always use the mapped property name when a user asks about a business term listed above.
-
+${SARAS_CONTEXT}
+${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}
 SCOPE RESTRICTION:
 You ONLY answer questions about HubSpot CRM data — deals, contacts, companies, pipelines, or Saras's sales and marketing activities.
 If a question is unrelated to HubSpot CRM (e.g. general company strategy, coding help, weather, internal ops tools, personal questions), respond with a brief, professional out-of-scope message. Keep it friendly, 2–3 sentences. Acknowledge what they asked, clarify your scope, and point them to the right place. Do NOT call any tools for out-of-scope questions.
