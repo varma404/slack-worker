@@ -11,7 +11,7 @@ const https = require('https');
 
 // ─── HubSpot API Client ───────────────────────────────────────────────────────
 
-function hubspotRequest(method, path, body = null) {
+function hubspotRequest(method, path, body = null, _retry = false) {
   return new Promise((resolve, reject) => {
     const data = body ? JSON.stringify(body) : null;
     const options = {
@@ -32,6 +32,10 @@ function hubspotRequest(method, path, body = null) {
       res.on('end', () => {
         try {
           const parsed = JSON.parse(raw);
+          if (res.statusCode === 429 && !_retry) {
+            setTimeout(() => hubspotRequest(method, path, body, true).then(resolve, reject), 1000);
+            return;
+          }
           if (res.statusCode >= 400) reject(new Error(`HubSpot ${res.statusCode}: ${parsed.message}`));
           else resolve(parsed);
         } catch (e) { reject(e); }
@@ -83,7 +87,7 @@ const TOOLS = [
         properties: { type: 'array', items: { type: 'string' }, description: 'Property names to return in results.' },
         sort_by: { type: 'string', description: 'Property to sort by (default: createdate)' },
         sort_direction: { type: 'string', enum: ['ASCENDING', 'DESCENDING'] },
-        limit: { type: 'integer', description: 'Max results 1-100 (default 20)', default: 20 }
+        limit: { type: 'integer', description: 'Max results 1-100 (default 100)', default: 100 }
       },
       required: ['object_type']
     }
@@ -228,15 +232,18 @@ async function executeTool(name, input) {
           ? input.properties
           : defaultProps[input.object_type] || ['createdate'];
         const body = {
-          limit: Math.min(input.limit || 20, 100),
+          limit: Math.min(input.limit || 100, 100),
           properties,
           sorts: [{ propertyName: input.sort_by || 'createdate', direction: input.sort_direction || 'DESCENDING' }],
           ...(filters.length > 0 ? { filterGroups: [{ filters }] } : {})
         };
         const res = await hubspotRequest('POST', `/crm/v3/objects/${input.object_type}/search`, body);
+        const total = res.total || 0;
+        const returned = res.results?.length || 0;
         return {
-          total: res.total || res.results?.length || 0,
-          returned: res.results?.length || 0,
+          total,
+          returned,
+          truncated: total > returned,
           results: res.results?.map(r => ({ id: r.id, ...r.properties }))
         };
       }
@@ -276,7 +283,8 @@ async function executeTool(name, input) {
         const filters = (input.deal_filters || []).map(f => {
           const filter = { propertyName: f.property, operator: f.operator };
           if (f.value !== undefined) {
-            filter.value = /^\d{4}-\d{2}-\d{2}/.test(f.value) ? new Date(f.value).getTime().toString() : f.value;
+            if (f.operator === 'IN') filter.value = f.value.replace(/,\s*/g, ';');
+            else filter.value = /^\d{4}-\d{2}-\d{2}/.test(f.value) ? new Date(f.value).getTime().toString() : f.value;
           }
           if (f.high_value !== undefined) {
             filter.highValue = /^\d{4}-\d{2}-\d{2}/.test(f.high_value) ? new Date(f.high_value).getTime().toString() : f.high_value;

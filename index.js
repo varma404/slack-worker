@@ -20,6 +20,12 @@ const SYSTEM_PROMPT = `You are a HubSpot CRM assistant for Saras Analytics. Resp
 
 ${SARAS_CONTEXT}
 ${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}
+ICP PROPERTY NAMES — use the exact name for each object:
+• Company: is_the_company_icp_ (one trailing underscore)
+• Contact: is_the_company_icp (no trailing underscore)
+• Deal: is_the_company_icp__ (two trailing underscores)
+Never use 'icp', 'hs_ideal_customer_profile', or any other variant.
+
 SCOPE RESTRICTION:
 You ONLY answer questions about HubSpot CRM data — deals, contacts, companies, pipelines, or Saras's sales and marketing activities.
 If a question is unrelated to HubSpot CRM (e.g. general company strategy, coding help, weather, internal ops tools, personal questions), respond with a brief, professional out-of-scope message. Keep it friendly, 2–3 sentences. Do NOT call any tools for out-of-scope questions.
@@ -29,8 +35,10 @@ TOOL SELECTION RULES:
 - Use search_objects / search_deals for deal-only queries with no company property filtering.
 - Use get_associations only when you need a one-off relationship lookup for a single record.
 - NEVER use the BETWEEN operator for ANY range query (dates, numbers, revenue, etc.) — it is unreliable on HubSpot properties. Instead, use two separate filters: GTE for the lower bound and LTE for the upper bound.
-- For multi-value matching (e.g. country = US or CA or UK), use the IN operator with comma-separated values.
+- For multi-value matching (e.g. country = US or CA or UK), use the IN operator with comma-separated values: { property: "country", operator: "IN", value: "United States,Canada,United Kingdom" }. Use full property values as stored in HubSpot.
 - When a user asks "why is X not in the list?", ALWAYS look up the record first using get_company/get_contact/get_deal, then compare its properties against the filters. Never guess or speculate before checking.
+- If a search returns 0 results and the user expected data, re-check your filters: verify the property name with get_object_properties, confirm you used GTE+LTE (not BETWEEN), and make sure you searched the correct object type (Company for MQLs, not Contact).
+- If a tool response includes "truncated": true, tell the user the exact total count and that you're showing a subset. Suggest narrowing filters if the total is large.
 
 RESPONSE RULES:
 - Call all tools silently — zero text output while fetching data
@@ -47,6 +55,7 @@ RESPONSE RULES:
 - Do NOT narrate your reasoning, show intermediate checks, or list records you rejected
 - Do NOT show ✅ / ❌ per record — only show records that matched
 - If listing matched records, show: name, stage, amount, and any other directly relevant fields
+- For result sets with more than 20 records, show a grouped summary (e.g. by stage, country, or source) with counts. Offer to list individual records if the user wants.
 
 SLACK FORMATTING RULES — follow strictly:
 - Bold: *text* (single asterisk, NOT double **)
@@ -70,6 +79,26 @@ const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
+// ─── Event Deduplication ─────────────────────────────────────────────────────
+
+const processedEvents = new Map();
+const DEDUP_TTL_MS = 60 * 1000;
+
+function isDuplicate(event) {
+  const eventId = event.client_msg_id || event.event_ts || event.ts;
+  if (!eventId) return false;
+  if (processedEvents.has(eventId)) return true;
+  processedEvents.set(eventId, Date.now());
+  if (processedEvents.size > 200) {
+    const cutoff = Date.now() - DEDUP_TTL_MS;
+    for (const [k, v] of processedEvents) {
+      if (v < cutoff) processedEvents.delete(k);
+      if (processedEvents.size <= 150) break;
+    }
+  }
+  return false;
+}
+
 // ─── Response Cache ───────────────────────────────────────────────────────────
 
 const responseCache = new Map();
@@ -92,7 +121,6 @@ function setCache(key, answer) {
 }
 
 // ─── Thread History Store ────────────────────────────────────────────────────
-// Stores conversation messages per thread for follow-up context.
 
 const threadHistory = new Map();
 const HISTORY_TTL_MS = 30 * 60 * 1000;
@@ -117,6 +145,20 @@ function storeThreadMessages(threadKey, messages) {
     ? messages.slice(-MAX_HISTORY_MESSAGES)
     : messages;
   threadHistory.set(threadKey, { messages: trimmed, ts: Date.now() });
+}
+
+// ─── Thread Lock ─────────────────────────────────────────────────────────────
+
+const threadLocks = new Map();
+
+function withThreadLock(threadKey, fn) {
+  const prev = threadLocks.get(threadKey) || Promise.resolve();
+  const current = prev.then(fn, fn);
+  threadLocks.set(threadKey, current);
+  current.finally(() => {
+    if (threadLocks.get(threadKey) === current) threadLocks.delete(threadKey);
+  });
+  return current;
 }
 
 // ─── Status Message Phrases ───────────────────────────────────────────────────
@@ -249,97 +291,105 @@ async function processEvent(event, slackToken) {
   const isDM = event.type === 'message' && event.channel_type === 'im';
   if (!isMention && !isDM) return;
 
+  if (isDuplicate(event)) {
+    console.log('[PROCESS] Duplicate event, skipping');
+    return;
+  }
+
   const question = event.text?.replace(/<@[A-Z0-9]+>/g, '').trim();
   if (!question) return;
 
   console.log('[PROCESS] Question:', question);
 
   const threadKey = getThreadKey(event);
-  const hasHistory = getThreadMessages(threadKey).length > 0;
 
-  const cacheKey = `${event.user || ''}:${event.channel}:${question.toLowerCase()}`;
-  if (!hasHistory) {
-    const cached = getCached(cacheKey);
-    if (cached) {
-      console.log('[PROCESS] Cache hit');
-      const blocks = buildAnswerBlocks(cached.answer);
-      blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_⚡ Cached result_' }] });
-      await slackRequest('/chat.postMessage', {
+  await withThreadLock(threadKey, async () => {
+    const hasHistory = getThreadMessages(threadKey).length > 0;
+
+    const cacheKey = `${event.user || ''}:${event.channel}:${question.toLowerCase()}`;
+    if (!hasHistory) {
+      const cached = getCached(cacheKey);
+      if (cached) {
+        console.log('[PROCESS] Cache hit');
+        const blocks = buildAnswerBlocks(cached.answer);
+        blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_⚡ Cached result_' }] });
+        await slackRequest('/chat.postMessage', {
+          channel: event.channel,
+          thread_ts: event.thread_ts || event.ts,
+          text: cached.answer.slice(0, 200),
+          blocks
+        }, slackToken).catch(err => console.error('[SLACK] Failed to post cached answer:', err.message));
+        return;
+      }
+    }
+
+    let statusTs = null;
+    try {
+      const statusMsg = await slackRequest('/chat.postMessage', {
         channel: event.channel,
         thread_ts: event.thread_ts || event.ts,
-        text: cached.answer.slice(0, 200),
-        blocks
-      }, slackToken).catch(err => console.error('[SLACK] Failed to post cached answer:', err.message));
-      return;
+        text: 'Analyzing your request...'
+      }, slackToken);
+      statusTs = statusMsg.ts;
+    } catch (err) {
+      console.error('[PROCESS] Failed to post status:', err.message);
     }
-  }
 
-  let statusTs = null;
-  try {
-    const statusMsg = await slackRequest('/chat.postMessage', {
+    async function statusUpdater(text) {
+      if (!statusTs) return;
+      await slackRequest('/chat.update', {
+        channel: event.channel,
+        ts: statusTs,
+        text
+      }, slackToken).catch(() => {});
+    }
+
+    let answer;
+    try {
+      answer = trimToAnswer(await askClaude(question, threadKey, statusUpdater));
+    } catch (err) {
+      console.error('[PROCESS] Claude error:', err.message);
+      const raw = err.message || '';
+      const limitMatch = raw.match(/you have reached your specified workspace api usage limits[^]*/i);
+      if (limitMatch) {
+        const detail = raw.match(/You will regain access[^".]*/i);
+        answer = `*API Usage Limit Reached*\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
+      } else {
+        answer = `*Error:* ${raw}`;
+      }
+    } finally {
+      if (statusTs) {
+        await slackRequest('/chat.delete', {
+          channel: event.channel,
+          ts: statusTs
+        }, slackToken).catch(err => console.error('[SLACK] Failed to delete status:', err.message));
+      }
+    }
+
+    if (!hasHistory) setCache(cacheKey, answer);
+
+    const blocks = buildAnswerBlocks(answer);
+
+    await slackRequest('/chat.postMessage', {
       channel: event.channel,
       thread_ts: event.thread_ts || event.ts,
-      text: 'Analyzing your request...'
-    }, slackToken);
-    statusTs = statusMsg.ts;
-  } catch (err) {
-    console.error('[PROCESS] Failed to post status:', err.message);
-  }
+      text: answer.slice(0, 200),
+      blocks
+    }, slackToken).catch(err => console.error('[SLACK] Failed to post answer:', err.message));
 
-  async function statusUpdater(text) {
-    if (!statusTs) return;
-    await slackRequest('/chat.update', {
-      channel: event.channel,
-      ts: statusTs,
-      text
-    }, slackToken).catch(() => {});
-  }
-
-  let answer;
-  try {
-    answer = trimToAnswer(await askClaude(question, threadKey, statusUpdater));
-  } catch (err) {
-    console.error('[PROCESS] Claude error:', err.message);
-    const raw = err.message || '';
-    const limitMatch = raw.match(/you have reached your specified workspace api usage limits[^]*/i);
-    if (limitMatch) {
-      const detail = raw.match(/You will regain access[^".]*/i);
-      answer = `*API Usage Limit Reached*\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
-    } else {
-      answer = `*Error:* ${raw}`;
+    const logChannel = process.env.LOG_CHANNEL_ID;
+    if (logChannel && event.user) {
+      const answerSnippet = answer.replace(/\*/g, '').slice(0, 300);
+      slackRequest('/chat.postMessage', {
+        channel: logChannel,
+        text: `*Q* from <@${event.user}> in <#${event.channel}>\n*Question:* ${question}\n*Answer:* ${answerSnippet}${answer.length > 300 ? '...' : ''}`,
+        unfurl_links: false,
+        unfurl_media: false
+      }, slackToken).catch(() => {});
     }
-  }
 
-  if (!hasHistory) setCache(cacheKey, answer);
-
-  const blocks = buildAnswerBlocks(answer);
-
-  if (statusTs) {
-    await slackRequest('/chat.delete', {
-      channel: event.channel,
-      ts: statusTs
-    }, slackToken).catch(err => console.error('[SLACK] Failed to delete status:', err.message));
-  }
-
-  await slackRequest('/chat.postMessage', {
-    channel: event.channel,
-    thread_ts: event.thread_ts || event.ts,
-    text: answer.slice(0, 200),
-    blocks
-  }, slackToken).catch(err => console.error('[SLACK] Failed to post answer:', err.message));
-
-  const logChannel = process.env.LOG_CHANNEL_ID;
-  if (logChannel && event.user) {
-    const answerSnippet = answer.replace(/\*/g, '').slice(0, 300);
-    slackRequest('/chat.postMessage', {
-      channel: logChannel,
-      text: `*Q* from <@${event.user}> in <#${event.channel}>\n*Question:* ${question}\n*Answer:* ${answerSnippet}${answer.length > 300 ? '...' : ''}`,
-      unfurl_links: false,
-      unfurl_media: false
-    }, slackToken).catch(() => {});
-  }
-
-  console.log('[PROCESS] Done');
+    console.log('[PROCESS] Done');
+  });
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -354,6 +404,10 @@ app.get('/health', (req, res) => res.json({
 }));
 
 app.post('/process', async (req, res) => {
+  if (process.env.SLACK_APP_TOKEN) {
+    return res.status(410).json({ error: 'Socket Mode active — webhook disabled' });
+  }
+
   const workerSecret = process.env.WORKER_SECRET;
   if (workerSecret && req.headers['x-worker-secret'] !== workerSecret) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -380,13 +434,13 @@ if (process.env.SLACK_APP_TOKEN) {
   });
 
   slackApp.event('app_mention', async ({ event }) => {
-    await processEvent(event, process.env.SLACK_BOT_TOKEN)
+    processEvent(event, process.env.SLACK_BOT_TOKEN)
       .catch(err => console.error('[BOLT] app_mention error:', err.message));
   });
 
   slackApp.event('message', async ({ event }) => {
     if (event.channel_type === 'im' && !event.bot_id && !event.subtype) {
-      await processEvent(event, process.env.SLACK_BOT_TOKEN)
+      processEvent(event, process.env.SLACK_BOT_TOKEN)
         .catch(err => console.error('[BOLT] message error:', err.message));
     }
   });
