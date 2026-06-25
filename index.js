@@ -28,6 +28,7 @@ TOOL SELECTION RULES:
 - For ANY question involving BOTH deals AND company properties (ICP status, company name, industry, revenue, etc.) → use get_deals_with_company_properties. This is a single batch call. Do NOT use get_associations one-by-one for this.
 - Use search_objects / search_deals for deal-only queries with no company property filtering.
 - Use get_associations only when you need a one-off relationship lookup for a single record.
+- For date range queries, NEVER use the BETWEEN operator — it is unreliable on HubSpot date properties. Instead, use two separate filters: GTE for the start date and LTE for the end date.
 
 RESPONSE RULES:
 - Call all tools silently — zero text output while fetching data
