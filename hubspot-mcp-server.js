@@ -73,7 +73,7 @@ const TOOLS = [
             type: 'object',
             properties: {
               property: { type: 'string' },
-              operator: { type: 'string', enum: ['EQ', 'NEQ', 'LT', 'LTE', 'GT', 'GTE', 'BETWEEN', 'HAS_PROPERTY', 'NOT_HAS_PROPERTY', 'CONTAINS_TOKEN', 'NOT_CONTAINS_TOKEN'] },
+              operator: { type: 'string', enum: ['EQ', 'NEQ', 'LT', 'LTE', 'GT', 'GTE', 'IN', 'HAS_PROPERTY', 'NOT_HAS_PROPERTY', 'CONTAINS_TOKEN', 'NOT_CONTAINS_TOKEN'] },
               value: { type: 'string' },
               high_value: { type: 'string' }
             },
@@ -127,7 +127,7 @@ const TOOLS = [
             type: 'object',
             properties: {
               property: { type: 'string' },
-              operator: { type: 'string', enum: ['EQ', 'NEQ', 'LT', 'LTE', 'GT', 'GTE', 'BETWEEN', 'HAS_PROPERTY', 'NOT_HAS_PROPERTY', 'CONTAINS_TOKEN', 'NOT_CONTAINS_TOKEN'] },
+              operator: { type: 'string', enum: ['EQ', 'NEQ', 'LT', 'LTE', 'GT', 'GTE', 'IN', 'HAS_PROPERTY', 'NOT_HAS_PROPERTY', 'CONTAINS_TOKEN', 'NOT_CONTAINS_TOKEN'] },
               value: { type: 'string' },
               high_value: { type: 'string' }
             },
@@ -216,7 +216,7 @@ async function executeTool(name, input) {
         const filters = (input.filters || []).map(f => ({
           propertyName: f.property,
           operator: f.operator,
-          ...(f.value !== undefined ? { value: toHubSpotValue(f.value) } : {}),
+          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
           ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
         }));
         const defaultProps = {
