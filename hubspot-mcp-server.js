@@ -49,6 +49,13 @@ function hubspotRequest(method, path, body = null, _retry = false) {
   });
 }
 
+function toHubSpotValue(v) {
+  if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v)) {
+    return String(new Date(v).getTime());
+  }
+  return v;
+}
+
 // ─── Tool Definitions ─────────────────────────────────────────────────────────
 
 const TOOLS = [
@@ -87,7 +94,8 @@ const TOOLS = [
         properties: { type: 'array', items: { type: 'string' }, description: 'Property names to return in results.' },
         sort_by: { type: 'string', description: 'Property to sort by (default: createdate)' },
         sort_direction: { type: 'string', enum: ['ASCENDING', 'DESCENDING'] },
-        limit: { type: 'integer', description: 'Max results 1-100 (default 100)', default: 100 }
+        limit: { type: 'integer', description: 'Max results 1-100 (default 100)', default: 100 },
+        after: { type: 'string', description: 'Pagination cursor from a previous response to get the next page of results.' }
       },
       required: ['object_type']
     }
@@ -140,7 +148,8 @@ const TOOLS = [
         },
         deal_properties: { type: 'array', items: { type: 'string' } },
         company_properties: { type: 'array', items: { type: 'string' } },
-        limit: { type: 'integer', default: 100 }
+        limit: { type: 'integer', default: 100 },
+        after: { type: 'string', description: 'Pagination cursor from a previous response to get the next page.' }
       },
       required: []
     }
@@ -193,6 +202,31 @@ const TOOLS = [
       },
       required: ['company_id']
     }
+  },
+  {
+    name: 'count_objects',
+    description: 'Get the exact count of objects matching filters WITHOUT returning records. Use for any "how many" question or monthly/periodic breakdown. Returns the accurate total from HubSpot (not capped at 100). Much faster than search_objects when you only need a number.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'], description: 'The CRM object type to count' },
+        filters: {
+          type: 'array',
+          description: 'Filters — all AND\'d together',
+          items: {
+            type: 'object',
+            properties: {
+              property: { type: 'string' },
+              operator: { type: 'string', enum: ['EQ', 'NEQ', 'LT', 'LTE', 'GT', 'GTE', 'IN', 'HAS_PROPERTY', 'NOT_HAS_PROPERTY', 'CONTAINS_TOKEN', 'NOT_CONTAINS_TOKEN'] },
+              value: { type: 'string' },
+              high_value: { type: 'string' }
+            },
+            required: ['property', 'operator']
+          }
+        }
+      },
+      required: ['object_type']
+    }
   }
 ];
 
@@ -211,12 +245,6 @@ async function executeTool(name, input) {
       }
 
       case 'search_objects': {
-        function toHubSpotValue(v) {
-          if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v)) {
-            return String(new Date(v).getTime());
-          }
-          return v;
-        }
         const filters = (input.filters || []).map(f => ({
           propertyName: f.property,
           operator: f.operator,
@@ -235,7 +263,8 @@ async function executeTool(name, input) {
           limit: Math.min(input.limit || 100, 100),
           properties,
           sorts: [{ propertyName: input.sort_by || 'createdate', direction: input.sort_direction || 'DESCENDING' }],
-          ...(filters.length > 0 ? { filterGroups: [{ filters }] } : {})
+          ...(filters.length > 0 ? { filterGroups: [{ filters }] } : {}),
+          ...(input.after ? { after: input.after } : {})
         };
         const res = await hubspotRequest('POST', `/crm/v3/objects/${input.object_type}/search`, body);
         const total = res.total || 0;
@@ -244,6 +273,7 @@ async function executeTool(name, input) {
           total,
           returned,
           truncated: total > returned,
+          after: res.paging?.next?.after || null,
           results: res.results?.map(r => ({ id: r.id, ...r.properties }))
         };
       }
@@ -298,7 +328,8 @@ async function executeTool(name, input) {
           limit: Math.min(input.limit || 100, 100),
           properties: dealProps,
           sorts: [{ propertyName: 'createdate', direction: 'DESCENDING' }],
-          ...(filters.length > 0 ? { filterGroups: [{ filters }] } : {})
+          ...(filters.length > 0 ? { filterGroups: [{ filters }] } : {}),
+          ...(input.after ? { after: input.after } : {})
         });
         const deals = dealSearch.results || [];
         if (deals.length === 0) return { total: 0, results: [] };
@@ -328,7 +359,10 @@ async function executeTool(name, input) {
         }
 
         return {
-          total: deals.length,
+          total: dealSearch.total || deals.length,
+          returned: deals.length,
+          truncated: (dealSearch.total || 0) > deals.length,
+          after: dealSearch.paging?.next?.after || null,
           results: deals.map(d => ({
             deal: { id: d.id, ...d.properties },
             company: dealToCompany[d.id] ? companyData[dealToCompany[d.id]] || null : null
@@ -360,6 +394,22 @@ async function executeTool(name, input) {
         const props = [...new Set([...baseProps, ...(input.properties || [])])].join(',');
         const res = await hubspotRequest('GET', `/crm/v3/objects/companies/${input.company_id}?properties=${props}`);
         return { id: res.id, ...res.properties };
+      }
+
+      case 'count_objects': {
+        const filters = (input.filters || []).map(f => ({
+          propertyName: f.property,
+          operator: f.operator,
+          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
+          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
+        }));
+        const body = {
+          limit: 1,
+          properties: ['hs_object_id'],
+          ...(filters.length > 0 ? { filterGroups: [{ filters }] } : {})
+        };
+        const res = await hubspotRequest('POST', `/crm/v3/objects/${input.object_type}/search`, body);
+        return { total: res.total || 0 };
       }
 
       default:

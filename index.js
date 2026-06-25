@@ -23,8 +23,27 @@ function buildSystemPrompt() {
 TODAY'S DATE: ${today}
 When the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.
 
-${SARAS_CONTEXT}
-${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}
+=== CRITICAL QUERY RULES ===
+
+MONTHLY/PERIODIC BREAKDOWNS:
+When the user asks for a breakdown by month, quarter, week, or any time period:
+- Make ONE SEPARATE count_objects call PER time period with tight GTE/LTE date filters.
+- NEVER fetch a wide date range in one query and then try to group records by reading date values. You WILL miscount.
+- Example: "ICP MQLs by month for Apr–Jun" → 3 separate count_objects calls, one per month.
+- Report the "total" field from each query response as the count — do NOT manually tally records from a results array.
+
+FOLLOW-UP CORRECTIONS:
+When the user challenges a number or says your answer is wrong:
+1. Re-read the ORIGINAL question in this thread to identify ALL filters that were applied.
+2. Re-query with the EXACT SAME filters. Never drop, simplify, or broaden filters to investigate.
+3. If the count differs, state the correction and show the records. If it matches, show the individual records for the user to verify.
+4. If the user clarifies a missing filter (e.g. "from marketing"), add it and re-query — do not argue.
+
+NEVER SPECULATE ABOUT HUBSPOT INTERNALS:
+- Do NOT invent explanations about how HubSpot stores values (boolean vs string, internal encodings, sync delays, workflow configs) to rationalize unexpected results.
+- If your count differs from what the user expects, the ONLY valid response is to re-query and show the actual records with their property values.
+- Say "Let me re-check the data" — never "The discrepancy is because HubSpot stores..."
+
 ICP PROPERTY NAMES — use the exact name for each object:
 • Company: is_the_company_icp_ (one trailing underscore)
 • Contact: is_the_company_icp (no trailing underscore)
@@ -36,6 +55,7 @@ You ONLY answer questions about HubSpot CRM data — deals, contacts, companies,
 If a question is unrelated to HubSpot CRM (e.g. general company strategy, coding help, weather, internal ops tools, personal questions), respond with a brief, professional out-of-scope message. Keep it friendly, 2–3 sentences. Do NOT call any tools for out-of-scope questions.
 
 TOOL SELECTION RULES:
+- For "how many" / count questions, use count_objects — it returns exact totals without fetching records. For breakdowns by time period, call count_objects once per period.
 - For ANY question involving BOTH deals AND company properties (ICP status, company name, industry, revenue, etc.) → use get_deals_with_company_properties. This is a single batch call. Do NOT use get_associations one-by-one for this.
 - Use search_objects / search_deals for deal-only queries with no company property filtering.
 - Use get_associations only when you need a one-off relationship lookup for a single record.
@@ -43,6 +63,7 @@ TOOL SELECTION RULES:
 - For multi-value matching (e.g. country = US or CA or UK), use the IN operator with comma-separated values: { property: "country", operator: "IN", value: "United States,Canada,United Kingdom" }. Use full property values as stored in HubSpot.
 - When a user asks "why is X not in the list?", ALWAYS look up the record first using get_company/get_contact/get_deal, then compare its properties against the filters. Never guess or speculate before checking.
 - If a search returns 0 results and the user expected data, re-check your filters: verify the property name with get_object_properties, confirm you used GTE+LTE (not BETWEEN), and make sure you searched the correct object type (Company for MQLs, not Contact).
+- When a search returns truncated: true and after is not null, you CAN call the same tool with the after cursor to get the next page — but only if the user's question requires all records. For counts, use count_objects instead.
 - If a tool response includes "truncated": true, tell the user the exact total count and that you're showing a subset. Suggest narrowing filters if the total is large.
 
 RESPONSE RULES:
@@ -69,7 +90,11 @@ SLACK FORMATTING RULES — follow strictly:
 - NO markdown tables (no | pipes) — use numbered lists instead
 - NO ## or # headers — use *Bold Title* on its own line
 
-Always use tools to fetch actual data — never say you "don't have access".`;
+Always use tools to fetch actual data — never say you "don't have access".
+
+=== SARAS BUSINESS CONTEXT ===
+${SARAS_CONTEXT}
+${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}`;
 }
 
 // Convert MCP tool format to Anthropic API format
@@ -179,6 +204,7 @@ const TOOL_STATUS = {
   get_contact: 'Fetching the record...',
   get_deal: 'Fetching the record...',
   get_company: 'Fetching the record...',
+  count_objects: 'Counting records...',
 };
 
 const FALLBACK_STATUSES = [
@@ -253,7 +279,8 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
   while (iterations++ < 15) {
     const response = await anthropic.messages.create({
       model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
-      max_tokens: 4096,
+      max_tokens: 16000,
+      thinking: { type: 'enabled', budget_tokens: 5000 },
       system: buildSystemPrompt(),
       tools: anthropicTools,
       messages,
