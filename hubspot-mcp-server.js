@@ -50,8 +50,8 @@ function hubspotRequest(method, path, body = null, _retry = false) {
 }
 
 function toHubSpotValue(v) {
-  if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v)) {
-    return String(new Date(v).getTime());
+  if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)) {
+    return String(new Date(v + 'T00:00:00Z').getTime());
   }
   return v;
 }
@@ -291,7 +291,7 @@ async function executeTool(name, input) {
           ...(filterGroups.length > 0 ? { filterGroups } : {})
         };
         const res = await hubspotRequest('POST', '/crm/v3/objects/contacts/search', body);
-        return { success: true, total: res.results?.length || 0, results: res.results?.map(c => ({ id: c.id, ...c.properties })) };
+        return { success: true, total: res.total || 0, returned: res.results?.length || 0, results: res.results?.map(c => ({ id: c.id, ...c.properties })) };
       }
 
       case 'search_deals': {
@@ -306,21 +306,16 @@ async function executeTool(name, input) {
           ...(filterGroups.length > 0 ? { filterGroups } : {})
         };
         const res = await hubspotRequest('POST', '/crm/v3/objects/deals/search', body);
-        return { success: true, total: res.results?.length || 0, results: res.results?.map(d => ({ id: d.id, ...d.properties })) };
+        return { success: true, total: res.total || 0, returned: res.results?.length || 0, results: res.results?.map(d => ({ id: d.id, ...d.properties })) };
       }
 
       case 'get_deals_with_company_properties': {
-        const filters = (input.deal_filters || []).map(f => {
-          const filter = { propertyName: f.property, operator: f.operator };
-          if (f.value !== undefined) {
-            if (f.operator === 'IN') filter.value = f.value.replace(/,\s*/g, ';');
-            else filter.value = /^\d{4}-\d{2}-\d{2}/.test(f.value) ? new Date(f.value).getTime().toString() : f.value;
-          }
-          if (f.high_value !== undefined) {
-            filter.highValue = /^\d{4}-\d{2}-\d{2}/.test(f.high_value) ? new Date(f.high_value).getTime().toString() : f.high_value;
-          }
-          return filter;
-        });
+        const filters = (input.deal_filters || []).map(f => ({
+          propertyName: f.property,
+          operator: f.operator,
+          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
+          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
+        }));
         const dealProps = input.deal_properties?.length
           ? input.deal_properties
           : ['dealname', 'dealstage', 'amount', 'closedate', 'createdate'];

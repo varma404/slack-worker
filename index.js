@@ -18,10 +18,10 @@ const SARAS_CONTEXT = fs.readFileSync(path.join(__dirname, 'saras_context.md'), 
 
 function buildSystemPrompt() {
   const today = new Date().toISOString().split('T')[0];
-  return `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
-
-TODAY'S DATE: ${today}
-When the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.
+  return [
+    {
+      type: 'text',
+      text: `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
 === CRITICAL QUERY RULES ===
 
@@ -94,7 +94,14 @@ Always use tools to fetch actual data — never say you "don't have access".
 
 === SARAS BUSINESS CONTEXT ===
 ${SARAS_CONTEXT}
-${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}`;
+${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}`,
+      cache_control: { type: 'ephemeral' }
+    },
+    {
+      type: 'text',
+      text: `TODAY'S DATE: ${today}\nWhen the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.`
+    }
+  ];
 }
 
 // Convert MCP tool format to Anthropic API format
@@ -221,6 +228,10 @@ function buildAnswerBlocks(answer) {
   const blocks = [];
   let remaining = answer;
   while (remaining.length > 2900) {
+    if (blocks.length >= 48) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '_Response truncated — ask me to narrow the results._' } });
+      return blocks;
+    }
     const split = remaining.lastIndexOf('\n', 2900);
     const cutAt = split > 1000 ? split : 2900;
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining.slice(0, cutAt) } });
@@ -286,9 +297,10 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
       messages,
     });
 
-    messages.push({ role: 'assistant', content: response.content });
+    const contentWithoutThinking = response.content.filter(b => b.type !== 'thinking');
+    messages.push({ role: 'assistant', content: contentWithoutThinking });
 
-    const toolBlocks = response.content.filter(b => b.type === 'tool_use');
+    const toolBlocks = contentWithoutThinking.filter(b => b.type === 'tool_use');
     if (response.stop_reason === 'end_turn' || toolBlocks.length === 0) {
       storeThreadMessages(threadKey, messages);
       const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
@@ -317,7 +329,10 @@ function trimToAnswer(text) {
 
 // ─── Event Processor ──────────────────────────────────────────────────────────
 
+let shuttingDown = false;
+
 async function processEvent(event, slackToken) {
+  if (shuttingDown) return;
   console.log('[PROCESS] event:', event.type, 'channel:', event.channel);
 
   const isMention = event.type === 'app_mention';
@@ -408,7 +423,14 @@ async function processEvent(event, slackToken) {
       thread_ts: event.thread_ts || event.ts,
       text: answer.slice(0, 200),
       blocks
-    }, slackToken).catch(err => console.error('[SLACK] Failed to post answer:', err.message));
+    }, slackToken).catch(err => {
+      console.error('[SLACK] Failed to post answer:', err.message);
+      slackRequest('/chat.postMessage', {
+        channel: event.channel,
+        thread_ts: event.thread_ts || event.ts,
+        text: 'Sorry, I had trouble formatting that response. Please try rephrasing your question.'
+      }, slackToken).catch(() => {});
+    });
 
     const logChannel = process.env.LOG_CHANNEL_ID;
     if (logChannel && event.user) {
@@ -454,7 +476,7 @@ app.post('/process', async (req, res) => {
   processEvent(event, token).catch(err => console.error('[WORKER ERROR]', err.message));
 });
 
-app.listen(PORT, () => console.log(`[WORKER] Listening on port ${PORT}`));
+const httpServer = app.listen(PORT, () => console.log(`[WORKER] Listening on port ${PORT}`));
 
 // ─── Slack Socket Mode (bolt) ─────────────────────────────────────────────────
 
@@ -467,6 +489,7 @@ if (process.env.SLACK_APP_TOKEN) {
   });
 
   slackApp.event('app_mention', async ({ event }) => {
+    if (event.bot_id || event.subtype) return;
     processEvent(event, process.env.SLACK_BOT_TOKEN)
       .catch(err => console.error('[BOLT] app_mention error:', err.message));
   });
@@ -484,3 +507,12 @@ if (process.env.SLACK_APP_TOKEN) {
 } else {
   console.log('[WORKER] No SLACK_APP_TOKEN — Socket Mode disabled, using Vercel webhook');
 }
+
+// ─── Graceful Shutdown ──────────────────────────────────────────────────────
+
+process.on('SIGTERM', () => {
+  console.log('[WORKER] SIGTERM received, draining...');
+  shuttingDown = true;
+  httpServer.close();
+  setTimeout(() => process.exit(0), 25000);
+});
