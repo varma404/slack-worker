@@ -16,7 +16,12 @@ const anthropic = new Anthropic();
 
 const SARAS_CONTEXT = fs.readFileSync(path.join(__dirname, 'saras_context.md'), 'utf8');
 
-const SYSTEM_PROMPT = `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
+function buildSystemPrompt() {
+  const today = new Date().toISOString().split('T')[0];
+  return `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
+
+TODAY'S DATE: ${today}
+When the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.
 
 ${SARAS_CONTEXT}
 ${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}
@@ -65,6 +70,7 @@ SLACK FORMATTING RULES — follow strictly:
 - NO ## or # headers — use *Bold Title* on its own line
 
 Always use tools to fetch actual data — never say you "don't have access".`;
+}
 
 // Convert MCP tool format to Anthropic API format
 const anthropicTools = MCP_TOOLS.map(t => ({
@@ -248,7 +254,7 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
     const response = await anthropic.messages.create({
       model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 4096,
-      system: SYSTEM_PROMPT,
+      system: buildSystemPrompt(),
       tools: anthropicTools,
       messages,
     });
