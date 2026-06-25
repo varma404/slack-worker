@@ -57,7 +57,7 @@ If a question is unrelated to HubSpot CRM (e.g. general company strategy, coding
 TOOL SELECTION RULES:
 - For "how many" / count questions, use count_objects — it returns exact totals without fetching records. For breakdowns by time period, call count_objects once per period.
 - For ANY question involving BOTH deals AND company properties (ICP status, company name, industry, revenue, etc.) → use get_deals_with_company_properties. This is a single batch call. Do NOT use get_associations one-by-one for this.
-- Use search_objects / search_deals for deal-only queries with no company property filtering.
+- Use search_objects for deal-only queries with no company property filtering.
 - Use get_associations only when you need a one-off relationship lookup for a single record.
 - NEVER use the BETWEEN operator for ANY range query (dates, numbers, revenue, etc.) — it is unreliable on HubSpot properties. Instead, use two separate filters: GTE for the lower bound and LTE for the upper bound.
 - For multi-value matching (e.g. country = US or CA or UK), use the IN operator with comma-separated values: { property: "country", operator: "IN", value: "United States,Canada,United Kingdom" }. Use full property values as stored in HubSpot.
@@ -204,8 +204,6 @@ function withThreadLock(threadKey, fn) {
 const TOOL_STATUS = {
   get_object_properties: 'Reading the CRM schema...',
   search_objects: 'Querying the pipeline...',
-  search_contacts: 'Searching for contacts...',
-  search_deals: 'Querying the pipeline...',
   get_deals_with_company_properties: 'Pulling deals and accounts...',
   get_associations: 'Connecting the dots...',
   get_contact: 'Fetching the record...',

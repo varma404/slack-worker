@@ -101,33 +101,6 @@ const TOOLS = [
     }
   },
   {
-    name: 'search_contacts',
-    description: 'Quick text search for contacts by name, email, or company. For filtering by custom properties or dates use search_objects instead.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: { type: 'string' },
-        created_after: { type: 'string', description: 'ISO date string' },
-        limit: { type: 'integer', default: 10 }
-      },
-      required: []
-    }
-  },
-  {
-    name: 'search_deals',
-    description: 'Search HubSpot deals with optional filters by stage or amount. For custom property filters use search_objects instead.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        dealstage: { type: 'string' },
-        amount_min: { type: 'number' },
-        amount_max: { type: 'number' },
-        limit: { type: 'integer', default: 10 }
-      },
-      required: []
-    }
-  },
-  {
     name: 'get_deals_with_company_properties',
     description: 'Efficiently fetch deals AND their associated company properties in a single batch operation. Use this for ANY cross-object question involving deals and companies — e.g. "deals where company is ICP", "deals where company revenue > X". Far more efficient than fetching associations one-by-one.',
     inputSchema: {
@@ -276,37 +249,6 @@ async function executeTool(name, input) {
           after: res.paging?.next?.after || null,
           results: res.results?.map(r => ({ id: r.id, ...r.properties }))
         };
-      }
-
-      case 'search_contacts': {
-        const filterGroups = [];
-        if (input.created_after) {
-          filterGroups.push({ filters: [{ propertyName: 'createdate', operator: 'GTE', value: new Date(input.created_after).getTime().toString() }] });
-        }
-        const body = {
-          limit: Math.min(input.limit || 10, 100),
-          properties: ['firstname', 'lastname', 'email', 'phone', 'company', 'createdate', 'hs_lead_status'],
-          sorts: [{ propertyName: 'createdate', direction: 'DESCENDING' }],
-          ...(input.query ? { query: input.query } : {}),
-          ...(filterGroups.length > 0 ? { filterGroups } : {})
-        };
-        const res = await hubspotRequest('POST', '/crm/v3/objects/contacts/search', body);
-        return { success: true, total: res.total || 0, returned: res.results?.length || 0, results: res.results?.map(c => ({ id: c.id, ...c.properties })) };
-      }
-
-      case 'search_deals': {
-        const filterGroups = [];
-        if (input.dealstage) filterGroups.push({ filters: [{ propertyName: 'dealstage', operator: 'EQ', value: input.dealstage }] });
-        if (input.amount_min) filterGroups.push({ filters: [{ propertyName: 'amount', operator: 'GTE', value: String(input.amount_min) }] });
-        if (input.amount_max) filterGroups.push({ filters: [{ propertyName: 'amount', operator: 'LTE', value: String(input.amount_max) }] });
-        const body = {
-          limit: Math.min(input.limit || 10, 100),
-          properties: ['dealname', 'dealstage', 'amount', 'closedate', 'pipeline'],
-          sorts: [{ propertyName: 'amount', direction: 'DESCENDING' }],
-          ...(filterGroups.length > 0 ? { filterGroups } : {})
-        };
-        const res = await hubspotRequest('POST', '/crm/v3/objects/deals/search', body);
-        return { success: true, total: res.total || 0, returned: res.results?.length || 0, results: res.results?.map(d => ({ id: d.id, ...d.properties })) };
       }
 
       case 'get_deals_with_company_properties': {
