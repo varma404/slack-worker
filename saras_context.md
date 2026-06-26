@@ -273,9 +273,12 @@ EXCEPTION PATHS:
 | Dead/Duplicate | `1140527923` (Nurture) | Future Interest / No response |
 | Churn | `1140600340` (Churn) | Churn |
 
-> **Funnel counting note**: Lifecycle stage reflects where a company IS NOW, not where it has been. To count companies that *reached* a given stage (including those who progressed further), filter by DEAL STAGE using IN with that stage plus all stages past it in the success path. Example: "reached Objective Win" → dealstage IN (appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon)
+> **Funnel counting note**: Both deal stage and lifecycle stage reflect current position, not history. A deal that was at Objective Win and moved to Sales Nurture or DQ still had its first meeting. A company that moved from opportunity to nurture lifecycle still had its first meeting.
 >
-> **First meeting booked shortcut**: A company at lifecyclestage = `opportunity` has ALREADY passed through First Meeting Booked. Use lifecyclestage IN (`2883794641`, `opportunity`, `customer`) to count all companies that have had their first meeting — not lifecyclestage = `2883794641` alone.
+> **First meeting happened** = company has a deal in Sales Pipeline (`pipeline = default`) at any stage EXCEPT: MQO (`152224771`) — no-show, meeting never occurred; Dead/Duplicate (`28023967`) — stale/invalid.
+> Full dealstage IN list: `appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon, closedlost, 217786505, 175509306, 175526434`
+>
+> **MQO ≠ first meeting**: MQO means the meeting was booked (Objective Win) but the prospect no-showed. Never count MQO deals when answering "how many booked/had their first meeting."
 
 ---
 

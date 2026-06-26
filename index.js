@@ -90,24 +90,28 @@ For "X vs Y ratio" or "X vs Y trend", make count_objects calls for each category
 - If a question says "deals with revenue < $X" without specifying deal or company, default to company revenue (estimated_yearly_sales__2025_) via get_deals_with_company_properties unless the user specifically says "deal amount".
 
 FUNNEL MILESTONE QUERIES ("how many reached X", "how many booked first meeting", "how many got to demo"):
-Lifecycle stage is a CURRENT state, not a cumulative count. A company that progressed from "First Meeting Booked" to "Opportunity" NO LONGER shows lifecyclestage = 2883794641 — they have moved on.
+Both lifecycle stage AND deal stage reflect CURRENT position only, not history. Do NOT use lifecycle stage alone for funnel milestone counts.
 
-To count how many reached a given milestone, check the DEAL STAGE (not lifecycle stage):
-  - "First meeting booked / Objective Win reached" → dealstage IN: appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon
-  - "SQL / Functional Win reached" → dealstage IN: qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon
-  - "Demo / Value Win reached" → dealstage IN: presentationscheduled, 28218292, contractsent, closedwon
+FIRST MEETING HAPPENED — correct definition:
+A company/deal had their first meeting if they have a deal in pipeline = default at ANY stage EXCEPT:
+  - MQO (152224771) — meeting was SCHEDULED but prospect NO-SHOWED → does NOT count as first meeting
+  - Dead/Duplicate (28023967) — stale or invalid, no meeting implied
+  - Junk — invalid lead
 
-Always use IN with the milestone stage AND all stages past it. Do NOT check lifecycle stage alone for funnel counts.
+Full "first meeting happened" dealstage IN list (use this):
+  appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent,
+  closedwon, closedlost, 217786505, 175509306, 175526434
 
-LIFECYCLE STAGE SHORTCUT for first meeting booked:
-Company lifecycle moves: Lead → MQL → First Meeting Booked (2883794641) → Opportunity → Customer.
-A company at lifecyclestage = opportunity has ALREADY passed through First Meeting Booked.
-Use lifecyclestage IN (2883794641, opportunity, customer) to count all companies that have had their first meeting — not lifecyclestage = 2883794641 alone.
+This correctly includes Sales Nurture (217786505), DQ (175509306), Closed Lost, and Churn — all require a meeting to have entered. A deal that went Objective Win → Sales Nurture or DQ STILL had its first meeting.
+
+For deeper funnel milestones:
+  - "SQL / Functional Win reached" → dealstage IN: qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon, closedlost, 217786505
+  - "Demo / Value Win reached" → dealstage IN: presentationscheduled, 28218292, contractsent, closedwon, closedlost
 
 For contact-level funnel attribution (e.g. "leads from source X → MQL → first meeting"):
 1. Leads: contacts matching the source filter (createdate range + source property)
-2. MQL: associated Company has mql_date IS NOT NULL (optionally within date range)
-3. First meeting booked: associated Company lifecyclestage IN (2883794641, opportunity, customer) OR has a deal at dealstage IN (appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon) in pipeline = default
+2. MQL: associated Company has mql_date IS NOT NULL
+3. First meeting happened: associated Company has a deal in pipeline = default with dealstage IN (appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon, closedlost, 217786505, 175509306, 175526434)
 
 RESPONSE RULES:
 - Call all tools silently — zero text output while fetching data
