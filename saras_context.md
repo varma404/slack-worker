@@ -273,6 +273,10 @@ EXCEPTION PATHS:
 | Dead/Duplicate | `1140527923` (Nurture) | Future Interest / No response |
 | Churn | `1140600340` (Churn) | Churn |
 
+> **Funnel counting note**: Lifecycle stage reflects where a company IS NOW, not where it has been. To count companies that *reached* a given stage (including those who progressed further), filter by DEAL STAGE using IN with that stage plus all stages past it in the success path. Example: "reached Objective Win" → dealstage IN (appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon)
+>
+> **First meeting booked shortcut**: A company at lifecyclestage = `opportunity` has ALREADY passed through First Meeting Booked. Use lifecyclestage IN (`2883794641`, `opportunity`, `customer`) to count all companies that have had their first meeting — not lifecyclestage = `2883794641` alone.
+
 ---
 
 ## SECTION 6 — LIFECYCLE STAGES
