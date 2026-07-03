@@ -18,10 +18,7 @@ const SARAS_CONTEXT = fs.readFileSync(path.join(__dirname, 'saras_context.md'), 
 
 function buildSystemPrompt() {
   const today = new Date().toISOString().split('T')[0];
-  return [
-    {
-      type: 'text',
-      text: `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
+  return `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
 === CRITICAL QUERY RULES ===
 
@@ -141,14 +138,10 @@ Always use tools to fetch actual data — never say you "don't have access".
 
 === SARAS BUSINESS CONTEXT ===
 ${SARAS_CONTEXT}
-${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}`,
-      cache_control: { type: 'ephemeral' }
-    },
-    {
-      type: 'text',
-      text: `TODAY'S DATE: ${today}\nWhen the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.`
-    }
-  ];
+${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}
+
+TODAY'S DATE: ${today}
+When the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.`;
 }
 
 // Convert MCP tool format to Anthropic API format
@@ -556,6 +549,17 @@ app.post('/process', async (req, res) => {
   res.status(200).json({ queued: true });
 
   processEvent(event, token).catch(err => console.error('[WORKER ERROR]', err.message));
+});
+
+app.post('/clear-history', (req, res) => {
+  const workerSecret = process.env.WORKER_SECRET;
+  if (workerSecret && req.headers['x-worker-secret'] !== workerSecret) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const count = threadHistory.size;
+  threadHistory.clear();
+  console.log(`[WORKER] Cleared ${count} thread histories`);
+  res.json({ cleared: count });
 });
 
 const httpServer = app.listen(PORT, () => console.log(`[WORKER] Listening on port ${PORT}`));
