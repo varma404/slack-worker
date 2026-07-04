@@ -5,6 +5,7 @@
  */
 
 const https = require('https');
+const { log } = require('./logger');
 
 // ─── HubSpot API Client ───────────────────────────────────────────────────────
 
@@ -232,7 +233,7 @@ const TOOLS = [
 
 // ─── Tool Executor ────────────────────────────────────────────────────────────
 
-async function executeTool(name, input) {
+async function executeTool(name, input, context = {}) {
   try {
     switch (name) {
 
@@ -443,7 +444,7 @@ async function executeTool(name, input) {
         return { error: `Unknown tool: ${name}` };
     }
   } catch (err) {
-    process.stderr.write(`[MCP] Tool error ${name}: ${err.message}\n`);
+    log('ERROR', 'hubspot_tool_error', { tool: name, error: err.message, correlation_id: context.correlation_id });
     return { error: err.message };
   }
 }
@@ -473,7 +474,7 @@ if (require.main === module) {
 
   const transport = new StdioServerTransport();
   server.connect(transport).catch(err => {
-    process.stderr.write(`[MCP] Failed to start: ${err.message}\n`);
+    log('ERROR', 'mcp_stdio_start_failed', { error: err.message });
     process.exit(1);
   });
 }

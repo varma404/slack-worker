@@ -9,6 +9,7 @@ const fs = require('fs');
 const Anthropic = require('@anthropic-ai/sdk');
 const { App } = require('@slack/bolt');
 const { TOOLS: MCP_TOOLS, executeTool } = require('./hubspot-mcp-server');
+const { log } = require('./logger');
 
 // ─── Claude Client & System Prompt ──────────────────────────────────────────
 
@@ -289,7 +290,30 @@ let fallbackIdx = 0;
 
 // ─── Slack Block Builder ──────────────────────────────────────────────────────
 
-function buildAnswerBlocks(answer) {
+function buildFeedbackBlock() {
+  return {
+    type: 'actions',
+    block_id: 'response_feedback',
+    elements: [
+      {
+        type: 'feedback_buttons',
+        action_id: 'feedback',
+        positive_button: {
+          text: { type: 'plain_text', text: 'Good Response' },
+          accessibility_label: 'Submit positive feedback',
+          value: 'good-feedback'
+        },
+        negative_button: {
+          text: { type: 'plain_text', text: 'Bad Response' },
+          accessibility_label: 'Submit negative feedback',
+          value: 'bad-feedback'
+        }
+      }
+    ]
+  };
+}
+
+function buildAnswerBlocks(answer, { skipFeedback = false } = {}) {
   const blocks = [];
   let remaining = answer;
   while (remaining.length > 2900) {
@@ -303,6 +327,7 @@ function buildAnswerBlocks(answer) {
     remaining = remaining.slice(cutAt).trimStart();
   }
   if (remaining) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining } });
+  if (!skipFeedback) blocks.push(buildFeedbackBlock());
   return blocks;
 }
 
@@ -347,8 +372,7 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
 
   const history = getThreadMessages(threadKey);
   const hasHistory = history.length > 0;
-  if (hasHistory) console.log(`[CLAUDE] Resuming thread ${threadKey} (${history.length} messages)`);
-  else console.log(`[CLAUDE] New thread ${threadKey}`);
+  log('INFO', 'thread_resume', { correlation_id: threadKey, resumed: hasHistory, historyLen: history.length });
 
   const messages = [...history, { role: 'user', content: question }];
 
@@ -376,9 +400,9 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
     const toolResults = [];
     for (const block of toolBlocks) {
       const statusText = TOOL_STATUS[block.name] || FALLBACK_STATUSES[fallbackIdx++ % FALLBACK_STATUSES.length];
-      console.log(`[CLAUDE] Tool: ${block.name}`);
+      log('INFO', 'tool_use', { correlation_id: threadKey, tool: block.name });
       await statusUpdater(statusText);
-      const result = await executeTool(block.name, block.input);
+      const result = await executeTool(block.name, block.input, { correlation_id: threadKey });
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
     }
     messages.push({ role: 'user', content: toolResults });
@@ -396,26 +420,29 @@ function trimToAnswer(text) {
 // ─── Event Processor ──────────────────────────────────────────────────────────
 
 let shuttingDown = false;
+const startTs = Date.now();
+let lastInvocationTs = null;
 
 async function processEvent(event, slackToken) {
   if (shuttingDown) return;
-  console.log('[PROCESS] event:', event.type, 'channel:', event.channel);
 
   const isMention = event.type === 'app_mention';
   const isDM = event.type === 'message' && event.channel_type === 'im';
   if (!isMention && !isDM) return;
 
+  const threadKey = getThreadKey(event);
+  log('INFO', 'event_received', { correlation_id: threadKey, eventType: event.type, channel: event.channel });
+
   if (isDuplicate(event)) {
-    console.log('[PROCESS] Duplicate event, skipping');
+    log('INFO', 'event_duplicate', { correlation_id: threadKey });
     return;
   }
 
   const question = event.text?.replace(/<@[A-Z0-9]+>/g, '').trim();
   if (!question) return;
 
-  console.log('[PROCESS] Question:', question);
-
-  const threadKey = getThreadKey(event);
+  lastInvocationTs = new Date().toISOString();
+  log('INFO', 'question_received', { correlation_id: threadKey, question });
 
   slackRequest('/reactions.add', {
     channel: event.channel,
@@ -430,7 +457,7 @@ async function processEvent(event, slackToken) {
     if (!hasHistory) {
       const cached = getCached(cacheKey);
       if (cached) {
-        console.log('[PROCESS] Cache hit');
+        log('INFO', 'cache_hit', { correlation_id: threadKey });
         const blocks = buildAnswerBlocks(cached.answer);
         blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_⚡ Cached result_' }] });
         await slackRequest('/chat.postMessage', {
@@ -438,7 +465,7 @@ async function processEvent(event, slackToken) {
           thread_ts: event.thread_ts || event.ts,
           text: cached.answer.slice(0, 200),
           blocks
-        }, slackToken).catch(err => console.error('[SLACK] Failed to post cached answer:', err.message));
+        }, slackToken).catch(err => log('ERROR', 'cached_answer_post_failed', { correlation_id: threadKey, error: err.message }));
         return;
       }
     }
@@ -452,7 +479,7 @@ async function processEvent(event, slackToken) {
       }, slackToken);
       statusTs = statusMsg.ts;
     } catch (err) {
-      console.error('[PROCESS] Failed to post status:', err.message);
+      log('ERROR', 'status_post_failed', { correlation_id: threadKey, error: err.message });
     }
 
     async function statusUpdater(text) {
@@ -461,14 +488,14 @@ async function processEvent(event, slackToken) {
         channel: event.channel,
         ts: statusTs,
         text
-      }, slackToken).catch(() => {});
+      }, slackToken).catch(err => log('WARN', 'status_update_failed', { correlation_id: threadKey, error: err.message }));
     }
 
     let answer;
     try {
       answer = trimToAnswer(await askClaude(question, threadKey, statusUpdater));
     } catch (err) {
-      console.error('[PROCESS] Claude error:', err.message);
+      log('ERROR', 'claude_error', { correlation_id: threadKey, error: err.message });
       const raw = err.message || '';
       const limitMatch = raw.match(/you have reached your specified workspace api usage limits[^]*/i);
       if (limitMatch) {
@@ -482,7 +509,7 @@ async function processEvent(event, slackToken) {
         await slackRequest('/chat.delete', {
           channel: event.channel,
           ts: statusTs
-        }, slackToken).catch(err => console.error('[SLACK] Failed to delete status:', err.message));
+        }, slackToken).catch(err => log('WARN', 'status_delete_failed', { correlation_id: threadKey, error: err.message }));
       }
     }
 
@@ -496,12 +523,21 @@ async function processEvent(event, slackToken) {
       text: answer.slice(0, 200),
       blocks
     }, slackToken).catch(err => {
-      console.error('[SLACK] Failed to post answer:', err.message);
+      log('ERROR', 'answer_post_failed', { correlation_id: threadKey, error: err.message });
       slackRequest('/chat.postMessage', {
         channel: event.channel,
         thread_ts: event.thread_ts || event.ts,
         text: 'Sorry, I had trouble formatting that response. Please try rephrasing your question.'
-      }, slackToken).catch(() => {});
+      }, slackToken).catch(err2 => {
+        log('ERROR', 'fallback_post_failed', { correlation_id: threadKey, error: err2.message });
+        const logChannel = process.env.LOG_CHANNEL_ID;
+        if (logChannel) {
+          slackRequest('/chat.postMessage', {
+            channel: logChannel,
+            text: `:rotating_light: Bot failed to answer <@${event.user}> in <#${event.channel}> (thread ${threadKey}) — both primary and fallback post failed. Error: ${err2.message}`
+          }, slackToken).catch(err3 => log('ERROR', 'admin_escalation_failed', { correlation_id: threadKey, error: err3.message }));
+        }
+      });
     });
 
     slackRequest('/reactions.remove', { channel: event.channel, timestamp: event.ts, name: 'eyes' }, slackToken).catch(() => {});
@@ -515,10 +551,10 @@ async function processEvent(event, slackToken) {
         text: `*Q* from <@${event.user}> in <#${event.channel}>\n*Question:* ${question}\n*Answer:* ${answerSnippet}${answer.length > 300 ? '...' : ''}`,
         unfurl_links: false,
         unfurl_media: false
-      }, slackToken).catch(() => {});
+      }, slackToken).catch(err => log('WARN', 'qa_log_post_failed', { correlation_id: threadKey, error: err.message }));
     }
 
-    console.log('[PROCESS] Done');
+    log('INFO', 'request_complete', { correlation_id: threadKey });
   });
 }
 
@@ -526,6 +562,10 @@ async function processEvent(event, slackToken) {
 
 app.get('/health', (req, res) => res.json({
   status: 'ok',
+  uptime_seconds: Math.floor((Date.now() - startTs) / 1000),
+  last_invocation_ts: lastInvocationTs,
+  active_threads: threadLocks.size,
+  thread_history_count: threadHistory.size,
   env: {
     hasHubspot: !!process.env.HUBSPOT_PRIVATE_APP_TOKEN,
     hasAnthropic: !!process.env.ANTHROPIC_API_KEY,
@@ -548,7 +588,7 @@ app.post('/process', async (req, res) => {
 
   res.status(200).json({ queued: true });
 
-  processEvent(event, token).catch(err => console.error('[WORKER ERROR]', err.message));
+  processEvent(event, token).catch(err => log('ERROR', 'webhook_process_error', { error: err.message }));
 });
 
 app.post('/clear-history', (req, res) => {
@@ -558,11 +598,11 @@ app.post('/clear-history', (req, res) => {
   }
   const count = threadHistory.size;
   threadHistory.clear();
-  console.log(`[WORKER] Cleared ${count} thread histories`);
+  log('INFO', 'thread_history_cleared', { count });
   res.json({ cleared: count });
 });
 
-const httpServer = app.listen(PORT, () => console.log(`[WORKER] Listening on port ${PORT}`));
+const httpServer = app.listen(PORT, () => log('INFO', 'worker_listening', { port: PORT }));
 
 // ─── Slack Socket Mode (bolt) ─────────────────────────────────────────────────
 
@@ -577,27 +617,27 @@ if (process.env.SLACK_APP_TOKEN) {
   slackApp.event('app_mention', async ({ event }) => {
     if (event.bot_id || event.subtype) return;
     processEvent(event, process.env.SLACK_BOT_TOKEN)
-      .catch(err => console.error('[BOLT] app_mention error:', err.message));
+      .catch(err => log('ERROR', 'bolt_app_mention_error', { error: err.message }));
   });
 
   slackApp.event('message', async ({ event }) => {
     if (event.channel_type === 'im' && !event.bot_id && !event.subtype) {
       processEvent(event, process.env.SLACK_BOT_TOKEN)
-        .catch(err => console.error('[BOLT] message error:', err.message));
+        .catch(err => log('ERROR', 'bolt_message_error', { error: err.message }));
     }
   });
 
   slackApp.start()
-    .then(() => console.log('[WORKER] Socket Mode active'))
-    .catch(err => console.error('[WORKER] Socket Mode failed to start:', err.message));
+    .then(() => log('INFO', 'socket_mode_active', {}))
+    .catch(err => log('ERROR', 'socket_mode_start_failed', { error: err.message }));
 } else {
-  console.log('[WORKER] No SLACK_APP_TOKEN — Socket Mode disabled, using Vercel webhook');
+  log('INFO', 'socket_mode_disabled', { reason: 'no SLACK_APP_TOKEN, using Vercel webhook' });
 }
 
 // ─── Graceful Shutdown ──────────────────────────────────────────────────────
 
 process.on('SIGTERM', () => {
-  console.log('[WORKER] SIGTERM received, draining...');
+  log('INFO', 'sigterm_received', {});
   shuttingDown = true;
   httpServer.close();
   setTimeout(() => process.exit(0), 25000);
