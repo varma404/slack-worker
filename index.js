@@ -70,13 +70,13 @@ Most questions have a clear best interpretation — resolve those yourself using
 3. A metric or term has no definition in the Saras business context AND no established default in this prompt, AND more than one reasonable interpretation would change the result (e.g. "our best customers" — by revenue? by deal count? by tenure? there is no default). Do NOT ask for terms that ARE defined (MQL, ICP, SQL, funnel milestones) — use the definition.
 4. A count/list request is scoped to an object or property that could plausibly mean two different HubSpot objects with different answers (e.g. "how many deals do we have with Acme" could mean deals associated with the Acme company record, or deals where the deal name contains "Acme" — ask if a quick get_object_properties/search_objects check shows both readings would return different counts).
 
-When in doubt, prefer answering with your best interpretation and stating it explicitly in *Filters applied:* over asking — a stated assumption the user can correct is better than an interruption, UNLESS the ambiguity is a fork in what OBJECT or WHICH RECORD the entire query is about (name collision, metric definition), in which case ask.
+When in doubt, prefer answering with your best interpretation and stating it explicitly in **Filters applied:** over asking — a stated assumption the user can correct is better than an interruption, UNLESS the ambiguity is a fork in what OBJECT or WHICH RECORD the entire query is about (name collision, metric definition), in which case ask.
 
 Ask AT MOST one question, offering the specific options you found (e.g. list the 2-3 matching companies with their domain/city to disambiguate). Never ask a vague "can you clarify?" — the question must name the specific fork and the concrete options.
 
 To ask a clarifying question: do not call any more tools. End your turn with text starting EXACTLY with:
 
-🤔 *Need a bit more detail:* <your specific question, naming the exact fork and options>
+🤔 **Need a bit more detail:** <your specific question, naming the exact fork and options>
 
 Do NOT use this prefix for anything except a genuine blocking ambiguity. Do NOT use it to ask permission to run a query, confirm scope, or hedge — only when you cannot proceed without the user's choice.
 
@@ -100,28 +100,29 @@ RESPONSE RULES:
 - Call all tools silently — zero text output while fetching data
 - Only produce text ONCE as your final answer, using this exact structure:
 
-*Answer:* <the direct result — count, list, or value>
+**Answer:** <the direct result — count, list, or value>
 
-*Filters applied:*
+**Filters applied:**
 • <filter 1>
 • <filter 2>
 
-*Notes:* <only if something important needs flagging>
+**Notes:** <only if something important needs flagging>
 
-If there is nothing to flag, omit the *Notes:* line entirely — do not write "*Notes:* None" or "*Notes:* N/A".
+If there is nothing to flag, omit the **Notes:** line entirely — do not write "**Notes:** None" or "**Notes:** N/A".
 
 - Do NOT narrate your reasoning, show intermediate checks, or list records you rejected
 - Do NOT show ✅ / ❌ per record — only show records that matched
 - If listing matched records, show: name, stage, amount, and any other directly relevant fields
 - For result sets with more than 20 records, show a grouped summary (e.g. by stage, country, or source) with counts. Offer to list individual records if the user wants.
-- Do NOT prefix *Answer:* with any lead-in text ("Here's what I found:", "Sure, here's the breakdown:", etc.) and do NOT add a closing line after your last section ("Let me know if you need anything else!", "Happy to dig deeper if needed."). The response ends at the last populated section.
+- Do NOT prefix **Answer:** with any lead-in text ("Here's what I found:", "Sure, here's the breakdown:", etc.) and do NOT add a closing line after your last section ("Let me know if you need anything else!", "Happy to dig deeper if needed."). The response ends at the last populated section.
+- You may use a standard Markdown table (header row, a separator row of dashes, then data rows, all using | to separate columns) when tabular data is the clearest presentation — it renders as a real table in Slack. Use it for genuinely tabular comparisons; for simple lists, a numbered/bulleted list is still often clearer.
 
 SLACK FORMATTING RULES — follow strictly:
-- Bold: *text* (single asterisk, NOT double **)
+- Bold: **text** (double asterisk — standard Markdown, NOT Slack's classic single-asterisk mrkdwn)
 - Bullet lists: start lines with •
 - Numbered lists: 1. 2. 3.
-- NO markdown tables (no | pipes) — use numbered lists instead
-- NO ## or # headers — use *Bold Title* on its own line
+- Markdown tables ARE supported — use pipe (|) syntax when a table is the clearest format
+- NO ## or # headers — use **Bold Title** on its own line
 
 Always use tools to fetch actual data — never say you "don't have access".
 
@@ -304,6 +305,42 @@ let fallbackIdx = 0;
 
 // ─── Slack Block Builder ──────────────────────────────────────────────────────
 
+// Approximate $/M-token rates. The raw Anthropic Messages API (unlike the
+// Claude Agent SDK) doesn't return a cost figure, so this is computed here.
+// Update if Anthropic's published pricing changes.
+const MODEL_RATES_PER_MTOK = {
+  'claude-sonnet-4-6': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+};
+const DEFAULT_RATES = MODEL_RATES_PER_MTOK['claude-sonnet-4-6'];
+
+function formatTokenCount(n) {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+  return String(n);
+}
+
+function estimateCostUsd(usage, model) {
+  const rates = MODEL_RATES_PER_MTOK[model] || DEFAULT_RATES;
+  return (
+    (usage.input_tokens / 1e6) * rates.input +
+    (usage.cache_read_input_tokens / 1e6) * rates.cacheRead +
+    (usage.cache_creation_input_tokens / 1e6) * rates.cacheWrite +
+    (usage.output_tokens / 1e6) * rates.output
+  );
+}
+
+function buildUsageFooter(usage) {
+  if (!usage) return null;
+  const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
+  const totalIn = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+  const cacheParts = [];
+  if (usage.cache_read_input_tokens) cacheParts.push(`${formatTokenCount(usage.cache_read_input_tokens)} cache read`);
+  if (usage.cache_creation_input_tokens) cacheParts.push(`${formatTokenCount(usage.cache_creation_input_tokens)} cache write`);
+  let inText = `${formatTokenCount(totalIn)} tokens in`;
+  if (cacheParts.length) inText += ` (${cacheParts.join(' · ')})`;
+  const cost = estimateCostUsd(usage, model);
+  return `${inText} · ${formatTokenCount(usage.output_tokens)} tokens out · $${cost.toFixed(4)}`;
+}
+
 function buildFeedbackBlock() {
   return {
     type: 'actions',
@@ -327,20 +364,28 @@ function buildFeedbackBlock() {
   };
 }
 
-function buildAnswerBlocks(answer, { skipFeedback = false } = {}) {
+// Uses Slack's native "markdown" block (standard CommonMark, incl. real
+// tables) rather than the classic "section"/"mrkdwn" block — see
+// SLACK FORMATTING RULES in the system prompt for the matching bold syntax.
+// Kept the same conservative 2900-char chunking as before the switch since
+// the markdown block's exact per-block limit isn't confirmed; splitting
+// smaller never hurts.
+function buildAnswerBlocks(answer, { skipFeedback = false, usage = null } = {}) {
   const blocks = [];
   let remaining = answer;
   while (remaining.length > 2900) {
     if (blocks.length >= 48) {
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '_Response truncated — ask me to narrow the results._' } });
+      blocks.push({ type: 'markdown', text: '_Response truncated — ask me to narrow the results._' });
       return blocks;
     }
     const split = remaining.lastIndexOf('\n', 2900);
     const cutAt = split > 1000 ? split : 2900;
-    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining.slice(0, cutAt) } });
+    blocks.push({ type: 'markdown', text: remaining.slice(0, cutAt) });
     remaining = remaining.slice(cutAt).trimStart();
   }
-  if (remaining) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining } });
+  if (remaining) blocks.push({ type: 'markdown', text: remaining });
+  const usageFooter = buildUsageFooter(usage);
+  if (usageFooter) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: usageFooter }] });
   if (!skipFeedback) blocks.push(buildFeedbackBlock());
   return blocks;
 }
@@ -381,6 +426,18 @@ function slackRequest(endpoint, payload, token) {
 
 // ─── Claude via Anthropic SDK ────────────────────────────────────────────────
 
+function emptyUsage() {
+  return { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+}
+
+function addUsage(totals, usage) {
+  if (!usage) return;
+  totals.input_tokens += usage.input_tokens || 0;
+  totals.output_tokens += usage.output_tokens || 0;
+  totals.cache_read_input_tokens += usage.cache_read_input_tokens || 0;
+  totals.cache_creation_input_tokens += usage.cache_creation_input_tokens || 0;
+}
+
 async function askClaude(question, threadKey, statusUpdater = async () => {}) {
   await statusUpdater('Analyzing your request...');
 
@@ -389,6 +446,7 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
   log('INFO', 'thread_resume', { correlation_id: threadKey, resumed: hasHistory, historyLen: history.length });
 
   const messages = [...history, { role: 'user', content: question }];
+  const usage = emptyUsage();
 
   const loopStartTs = Date.now();
   const MAX_LOOP_MS = 100_000;
@@ -397,7 +455,7 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
     if (Date.now() - loopStartTs > MAX_LOOP_MS) {
       log('WARN', 'agent_loop_time_exceeded', { correlation_id: threadKey, iterations, elapsedMs: Date.now() - loopStartTs });
       storeThreadMessages(threadKey, messages);
-      return 'This is taking too long — try narrowing your question.';
+      return { text: 'This is taking too long — try narrowing your question.', usage };
     }
     const response = await anthropic.messages.create({
       model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
@@ -407,6 +465,7 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
       tools: anthropicTools,
       messages,
     });
+    addUsage(usage, response.usage);
 
     const contentWithoutThinking = response.content.filter(b => b.type !== 'thinking');
     messages.push({ role: 'assistant', content: contentWithoutThinking });
@@ -415,7 +474,7 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
     if (response.stop_reason === 'end_turn' || toolBlocks.length === 0) {
       storeThreadMessages(threadKey, messages);
       const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-      return text || 'No response generated.';
+      return { text: text || 'No response generated.', usage };
     }
 
     const toolResults = [];
@@ -437,21 +496,22 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
     const summaryResp = await anthropic.messages.create({
       model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 2000,
-      system: buildSystemPrompt('You have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the *Answer:* / *Filters applied:* / *Notes:* structure, but replace *Answer:* with *Partial answer (ran out of steps):* and use *Notes:* to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).'),
+      system: buildSystemPrompt('You have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the **Answer:** / **Filters applied:** / **Notes:** structure, but replace **Answer:** with **Partial answer (ran out of steps):** and use **Notes:** to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).'),
       tools: anthropicTools,
       tool_choice: { type: 'none' },
       messages,
     });
+    addUsage(usage, summaryResp.usage);
     const text = summaryResp.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-    return text || FALLBACK_TEXT;
+    return { text: text || FALLBACK_TEXT, usage };
   } catch (err) {
     log('ERROR', 'partial_progress_summary_failed', { correlation_id: threadKey, error: err.message });
-    return FALLBACK_TEXT;
+    return { text: FALLBACK_TEXT, usage };
   }
 }
 
 function trimToAnswer(text) {
-  const match = text.match(/(\*Answer:|Answer:)/);
+  const match = text.match(/(\*\*Answer:|\*Answer:|Answer:)/);
   return match ? text.slice(match.index) : text;
 }
 
@@ -530,17 +590,20 @@ async function processEvent(event, slackToken) {
     }
 
     let answer;
+    let answerUsage = null;
     try {
-      answer = trimToAnswer(await askClaude(question, threadKey, statusUpdater));
+      const result = await askClaude(question, threadKey, statusUpdater);
+      answer = trimToAnswer(result.text);
+      answerUsage = result.usage;
     } catch (err) {
       log('ERROR', 'claude_error', { correlation_id: threadKey, error: err.message });
       const raw = err.message || '';
       const limitMatch = raw.match(/you have reached your specified workspace api usage limits[^]*/i);
       if (limitMatch) {
         const detail = raw.match(/You will regain access[^".]*/i);
-        answer = `*API Usage Limit Reached*\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
+        answer = `**API Usage Limit Reached**\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
       } else {
-        answer = `*Error:* ${raw}`;
+        answer = `**Error:** ${raw}`;
       }
     } finally {
       if (statusTs) {
@@ -551,11 +614,11 @@ async function processEvent(event, slackToken) {
       }
     }
 
-    const isClarification = answer.startsWith('🤔 *Need a bit more detail:*');
+    const isClarification = answer.startsWith('🤔 **Need a bit more detail:**');
 
     if (!hasHistory && !isClarification) setCache(cacheKey, answer);
 
-    const blocks = buildAnswerBlocks(answer, { skipFeedback: isClarification });
+    const blocks = buildAnswerBlocks(answer, { skipFeedback: isClarification, usage: isClarification ? null : answerUsage });
 
     await slackRequest('/chat.postMessage', {
       channel: event.channel,
