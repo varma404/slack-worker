@@ -30,14 +30,16 @@ const anthropic = new Anthropic();
 const SARAS_CONTEXT = fs.readFileSync(path.join(__dirname, 'saras_context.md'), 'utf8');
 const QUERY_PLAYBOOKS = fs.readFileSync(path.join(__dirname, 'query_playbooks.md'), 'utf8');
 
+// NOTE: prompt caching (cache_control on the static block) is intentionally
+// NOT enabled yet. It was reintroduced in a follow-up commit but is being
+// held back as a plain string for a few days so the tool_use/tool_result
+// pairing fix (see storeThreadMessages) can be verified in production
+// first — re-enable once confirmed stable (see PR #1 for full context).
 function buildSystemPrompt(addendum = null) {
   const today = new Date().toISOString().split('T')[0];
-  const blocks = [
-    { type: 'text', text: buildStaticPromptBody(), cache_control: { type: 'ephemeral' } },
-    { type: 'text', text: `TODAY'S DATE: ${today}\nWhen the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.` },
-  ];
-  if (addendum) blocks.push({ type: 'text', text: addendum });
-  return blocks;
+  let prompt = `${buildStaticPromptBody()}\n\nTODAY'S DATE: ${today}\nWhen the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.`;
+  if (addendum) prompt += `\n\n${addendum}`;
+  return prompt;
 }
 
 function buildStaticPromptBody() {
