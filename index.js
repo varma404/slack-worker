@@ -16,6 +16,7 @@ const { log } = require('./logger');
 const anthropic = new Anthropic();
 
 const SARAS_CONTEXT = fs.readFileSync(path.join(__dirname, 'saras_context.md'), 'utf8');
+const QUERY_PLAYBOOKS = fs.readFileSync(path.join(__dirname, 'query_playbooks.md'), 'utf8');
 
 function buildSystemPrompt() {
   const today = new Date().toISOString().split('T')[0];
@@ -65,51 +66,8 @@ TOOL SELECTION RULES:
 - When a search returns truncated: true and after is not null, you CAN call the same tool with the after cursor to get the next page — but only if the user's question requires all records. For counts, use count_objects instead.
 - If a tool response includes "truncated": true, tell the user the exact total count and that you're showing a subset. Suggest narrowing filters if the total is large.
 
-COMPLEX QUERY PATTERNS:
-
-"Moved past [stage]" / "after [stage]":
-The Sales Pipeline stage order is: Objective Win → Functional Win → Value Win → Commercial Win → Legal Win → Closed Won.
-"Moved past Objective Win" means the deal's current dealstage is any stage AFTER Objective Win: qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon.
-Use the IN operator with all stages past the named one. Do NOT include closedlost, MQO, DQ, Sales Nurture, or Dead/Duplicate — those are exit paths, not progression.
-
-Cross-object contact + company questions:
-For questions needing contact details WITH company properties (name, ICP, revenue), use get_contacts_with_company_properties. This handles the batch lookup in one call.
-Example: "CXOs at ICP companies" → get_contacts_with_company_properties with jobtitle filter + request company is_the_company_icp_ property, then filter results where company.is_the_company_icp_ = Yes.
-
-CXO / C-level title search:
-HubSpot jobtitle is a free-text field. To find C-level contacts, search with CONTAINS_TOKEN for "Chief" — this catches CEO, CFO, CTO, CMO, COO, and other Chief titles in one query. If you need specific titles only, make separate searches per title and deduplicate by contact ID.
-
-Ratio / comparison questions:
-For "X vs Y ratio" or "X vs Y trend", make count_objects calls for each category per time period. Present results as a numbered list with both counts and the calculated ratio/percentage.
-
-"Revenue" in deal vs company context:
-- "Deal value" / "deal amount" / "ARR" → amount on Deal
-- "Company revenue" / "annual revenue" / "revenue" when filtering companies → estimated_yearly_sales__2025_ on Company
-- If a question says "deals with revenue < $X" without specifying deal or company, default to company revenue (estimated_yearly_sales__2025_) via get_deals_with_company_properties unless the user specifically says "deal amount".
-
-FUNNEL MILESTONE QUERIES ("how many reached X", "how many booked first meeting", "how many got to demo"):
-Both lifecycle stage AND deal stage reflect CURRENT position only, not history. Do NOT use lifecycle stage alone for funnel milestone counts.
-
-FIRST MEETING HAPPENED — correct definition:
-A company/deal had their first meeting if they have a deal in pipeline = default at ANY stage EXCEPT:
-  - MQO (152224771) — meeting was SCHEDULED but prospect NO-SHOWED → does NOT count as first meeting
-  - Dead/Duplicate (28023967) — stale or invalid, no meeting implied
-  - Junk — invalid lead
-
-Full "first meeting happened" dealstage IN list (use this):
-  appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent,
-  closedwon, closedlost, 217786505, 175509306, 175526434
-
-This correctly includes Sales Nurture (217786505), DQ (175509306), Closed Lost, and Churn — all require a meeting to have entered. A deal that went Objective Win → Sales Nurture or DQ STILL had its first meeting.
-
-For deeper funnel milestones:
-  - "SQL / Functional Win reached" → dealstage IN: qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon, closedlost, 217786505
-  - "Demo / Value Win reached" → dealstage IN: presentationscheduled, 28218292, contractsent, closedwon, closedlost
-
-For contact-level funnel attribution (e.g. "leads from source X → MQL → first meeting"):
-1. Leads: contacts matching the source filter (createdate range + source property)
-2. MQL: associated Company has mql_date IS NOT NULL
-3. First meeting happened: associated Company has a deal in pipeline = default with dealstage IN (appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon, closedlost, 217786505, 175509306, 175526434)
+=== QUERY PLAYBOOKS ===
+${QUERY_PLAYBOOKS}
 
 RESPONSE RULES:
 - Call all tools silently — zero text output while fetching data
@@ -121,12 +79,15 @@ RESPONSE RULES:
 • <filter 1>
 • <filter 2>
 
-*Notes:* <only if something important needs flagging — skip if nothing to flag>
+*Notes:* <only if something important needs flagging>
+
+If there is nothing to flag, omit the *Notes:* line entirely — do not write "*Notes:* None" or "*Notes:* N/A".
 
 - Do NOT narrate your reasoning, show intermediate checks, or list records you rejected
 - Do NOT show ✅ / ❌ per record — only show records that matched
 - If listing matched records, show: name, stage, amount, and any other directly relevant fields
 - For result sets with more than 20 records, show a grouped summary (e.g. by stage, country, or source) with counts. Offer to list individual records if the user wants.
+- Do NOT prefix *Answer:* with any lead-in text ("Here's what I found:", "Sure, here's the breakdown:", etc.) and do NOT add a closing line after your last section ("Let me know if you need anything else!", "Happy to dig deeper if needed."). The response ends at the last populated section.
 
 SLACK FORMATTING RULES — follow strictly:
 - Bold: *text* (single asterisk, NOT double **)
@@ -244,11 +205,21 @@ function compressHistory(messages) {
   });
 }
 
+function isToolResultMessage(msg) {
+  return msg.role === 'user' && Array.isArray(msg.content) &&
+    msg.content.some(b => b.type === 'tool_result');
+}
+
 function storeThreadMessages(threadKey, messages) {
   const compressed = compressHistory(messages);
-  const trimmed = compressed.length > MAX_HISTORY_MESSAGES
-    ? compressed.slice(-MAX_HISTORY_MESSAGES)
-    : compressed;
+  let trimmed = compressed;
+  if (compressed.length > MAX_HISTORY_MESSAGES) {
+    let start = compressed.length - MAX_HISTORY_MESSAGES;
+    // Never start the window on a tool_result message — that would orphan it
+    // from the tool_use block in the assistant message immediately before it.
+    while (start > 0 && isToolResultMessage(compressed[start])) start--;
+    trimmed = compressed.slice(start);
+  }
   threadHistory.set(threadKey, { messages: trimmed, ts: Date.now() });
 }
 

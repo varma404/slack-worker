@@ -9,7 +9,14 @@ const { log } = require('./logger');
 
 // ─── HubSpot API Client ───────────────────────────────────────────────────────
 
-function hubspotRequest(method, path, body = null, _retry = false) {
+const HUBSPOT_MAX_RETRIES = 3;
+const HUBSPOT_RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
+function hubspotBackoffDelay(attempt) {
+  return Math.min(1000 * 2 ** attempt, 8000) + Math.floor(Math.random() * 250);
+}
+
+function hubspotRequest(method, path, body = null, _attempt = 0) {
   return new Promise((resolve, reject) => {
     const data = body ? JSON.stringify(body) : null;
     const options = {
@@ -24,24 +31,43 @@ function hubspotRequest(method, path, body = null, _retry = false) {
       }
     };
 
+    let settled = false;
+    const retry = (reason) => {
+      if (settled) return;
+      settled = true;
+      if (_attempt < HUBSPOT_MAX_RETRIES) {
+        const delay = hubspotBackoffDelay(_attempt);
+        log('WARN', 'hubspot_retry', { path, attempt: _attempt + 1, delay, reason });
+        setTimeout(() => hubspotRequest(method, path, body, _attempt + 1).then(resolve, reject), delay);
+      } else {
+        reject(reason instanceof Error ? reason : new Error(String(reason)));
+      }
+    };
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
+
     const req = https.request(options, (res) => {
       let raw = '';
       res.on('data', c => raw += c);
       res.on('end', () => {
+        if (settled) return;
         try {
           const parsed = JSON.parse(raw);
-          if (res.statusCode === 429 && !_retry) {
-            setTimeout(() => hubspotRequest(method, path, body, true).then(resolve, reject), 1000);
+          if (HUBSPOT_RETRYABLE_STATUS.has(res.statusCode)) {
+            retry(`HubSpot ${res.statusCode}: ${parsed.message}`);
             return;
           }
-          if (res.statusCode >= 400) reject(new Error(`HubSpot ${res.statusCode}: ${parsed.message}`));
-          else resolve(parsed);
-        } catch (e) { reject(e); }
+          if (res.statusCode >= 400) settle(reject, new Error(`HubSpot ${res.statusCode}: ${parsed.message}`));
+          else settle(resolve, parsed);
+        } catch (e) { settle(reject, e); }
       });
     });
 
-    req.on('error', reject);
-    req.setTimeout(15000, () => { req.destroy(); reject(new Error('HubSpot timeout')); });
+    req.on('error', (err) => retry(err));
+    req.setTimeout(15000, () => { req.destroy(); retry(new Error('HubSpot timeout')); });
     if (data) req.write(data);
     req.end();
   });
