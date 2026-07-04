@@ -3,21 +3,44 @@
  */
 
 const express = require('express');
-const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const Anthropic = require('@anthropic-ai/sdk');
 const { App } = require('@slack/bolt');
 const { TOOLS: MCP_TOOLS, executeTool } = require('./hubspot-mcp-server');
+const { log } = require('./logger');
+const { slackRequest, buildAnswerBlocks, getToolStatus } = require('./slack-client');
+const {
+  isDuplicate,
+  getCached,
+  setCache,
+  getThreadKey,
+  getThreadMessages,
+  storeThreadMessages,
+  getThreadHistoryCount,
+  clearThreadHistory,
+  withThreadLock,
+  getActiveThreadCount,
+} = require('./thread-state');
 
 // ─── Claude Client & System Prompt ──────────────────────────────────────────
 
 const anthropic = new Anthropic();
 
 const SARAS_CONTEXT = fs.readFileSync(path.join(__dirname, 'saras_context.md'), 'utf8');
+const QUERY_PLAYBOOKS = fs.readFileSync(path.join(__dirname, 'query_playbooks.md'), 'utf8');
 
-function buildSystemPrompt() {
+function buildSystemPrompt(addendum = null) {
   const today = new Date().toISOString().split('T')[0];
+  const blocks = [
+    { type: 'text', text: buildStaticPromptBody(), cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: `TODAY'S DATE: ${today}\nWhen the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.` },
+  ];
+  if (addendum) blocks.push({ type: 'text', text: addendum });
+  return blocks;
+}
+
+function buildStaticPromptBody() {
   return `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
 === CRITICAL QUERY RULES ===
@@ -51,6 +74,24 @@ SCOPE RESTRICTION:
 You ONLY answer questions about HubSpot CRM data — deals, contacts, companies, pipelines, or Saras's sales and marketing activities.
 If a question is unrelated to HubSpot CRM (e.g. general company strategy, coding help, weather, internal ops tools, personal questions), respond with a brief, professional out-of-scope message. Keep it friendly, 2–3 sentences. Do NOT call any tools for out-of-scope questions.
 
+CLARIFICATION — WHEN TO ASK INSTEAD OF ANSWERING:
+Most questions have a clear best interpretation — resolve those yourself using the defaults and patterns in this prompt. Only ask a clarifying question when the ambiguity would silently change the numeric result or record set returned, AND no default below resolves it. Concretely, ask when:
+
+1. A company/person name in the question matches more than one HubSpot record and the records are meaningfully different (different domains, different deal stages) — do NOT ask if one match is an obvious best fit (exact name match vs. partial/fuzzy match) or the question doesn't care which one it is.
+2. A relative or informal time range is genuinely two-way ambiguous — e.g. "last quarter" when today is early in a quarter (could mean the quarter just ended or the one before), or "this week" said on a Monday close to a month boundary. Do NOT ask about "this month", "last 3 months", "this year" — those resolve unambiguously from TODAY'S DATE below.
+3. A metric or term has no definition in the Saras business context AND no established default in this prompt, AND more than one reasonable interpretation would change the result (e.g. "our best customers" — by revenue? by deal count? by tenure? there is no default). Do NOT ask for terms that ARE defined (MQL, ICP, SQL, funnel milestones) — use the definition.
+4. A count/list request is scoped to an object or property that could plausibly mean two different HubSpot objects with different answers (e.g. "how many deals do we have with Acme" could mean deals associated with the Acme company record, or deals where the deal name contains "Acme" — ask if a quick get_object_properties/search_objects check shows both readings would return different counts).
+
+When in doubt, prefer answering with your best interpretation and stating it explicitly in **Filters applied:** over asking — a stated assumption the user can correct is better than an interruption, UNLESS the ambiguity is a fork in what OBJECT or WHICH RECORD the entire query is about (name collision, metric definition), in which case ask.
+
+Ask AT MOST one question, offering the specific options you found (e.g. list the 2-3 matching companies with their domain/city to disambiguate). Never ask a vague "can you clarify?" — the question must name the specific fork and the concrete options.
+
+To ask a clarifying question: do not call any more tools. End your turn with text starting EXACTLY with:
+
+🤔 **Need a bit more detail:** <your specific question, naming the exact fork and options>
+
+Do NOT use this prefix for anything except a genuine blocking ambiguity. Do NOT use it to ask permission to run a query, confirm scope, or hedge — only when you cannot proceed without the user's choice.
+
 TOOL SELECTION RULES:
 - For "how many" / count questions, use count_objects — it returns exact totals without fetching records. For breakdowns by time period, call count_objects once per period.
 - For ANY question involving BOTH deals AND company properties (ICP status, company name, industry, revenue, etc.) → use get_deals_with_company_properties. This is a single batch call. Do NOT use get_associations one-by-one for this.
@@ -64,84 +105,42 @@ TOOL SELECTION RULES:
 - When a search returns truncated: true and after is not null, you CAN call the same tool with the after cursor to get the next page — but only if the user's question requires all records. For counts, use count_objects instead.
 - If a tool response includes "truncated": true, tell the user the exact total count and that you're showing a subset. Suggest narrowing filters if the total is large.
 
-COMPLEX QUERY PATTERNS:
-
-"Moved past [stage]" / "after [stage]":
-The Sales Pipeline stage order is: Objective Win → Functional Win → Value Win → Commercial Win → Legal Win → Closed Won.
-"Moved past Objective Win" means the deal's current dealstage is any stage AFTER Objective Win: qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon.
-Use the IN operator with all stages past the named one. Do NOT include closedlost, MQO, DQ, Sales Nurture, or Dead/Duplicate — those are exit paths, not progression.
-
-Cross-object contact + company questions:
-For questions needing contact details WITH company properties (name, ICP, revenue), use get_contacts_with_company_properties. This handles the batch lookup in one call.
-Example: "CXOs at ICP companies" → get_contacts_with_company_properties with jobtitle filter + request company is_the_company_icp_ property, then filter results where company.is_the_company_icp_ = Yes.
-
-CXO / C-level title search:
-HubSpot jobtitle is a free-text field. To find C-level contacts, search with CONTAINS_TOKEN for "Chief" — this catches CEO, CFO, CTO, CMO, COO, and other Chief titles in one query. If you need specific titles only, make separate searches per title and deduplicate by contact ID.
-
-Ratio / comparison questions:
-For "X vs Y ratio" or "X vs Y trend", make count_objects calls for each category per time period. Present results as a numbered list with both counts and the calculated ratio/percentage.
-
-"Revenue" in deal vs company context:
-- "Deal value" / "deal amount" / "ARR" → amount on Deal
-- "Company revenue" / "annual revenue" / "revenue" when filtering companies → estimated_yearly_sales__2025_ on Company
-- If a question says "deals with revenue < $X" without specifying deal or company, default to company revenue (estimated_yearly_sales__2025_) via get_deals_with_company_properties unless the user specifically says "deal amount".
-
-FUNNEL MILESTONE QUERIES ("how many reached X", "how many booked first meeting", "how many got to demo"):
-Both lifecycle stage AND deal stage reflect CURRENT position only, not history. Do NOT use lifecycle stage alone for funnel milestone counts.
-
-FIRST MEETING HAPPENED — correct definition:
-A company/deal had their first meeting if they have a deal in pipeline = default at ANY stage EXCEPT:
-  - MQO (152224771) — meeting was SCHEDULED but prospect NO-SHOWED → does NOT count as first meeting
-  - Dead/Duplicate (28023967) — stale or invalid, no meeting implied
-  - Junk — invalid lead
-
-Full "first meeting happened" dealstage IN list (use this):
-  appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent,
-  closedwon, closedlost, 217786505, 175509306, 175526434
-
-This correctly includes Sales Nurture (217786505), DQ (175509306), Closed Lost, and Churn — all require a meeting to have entered. A deal that went Objective Win → Sales Nurture or DQ STILL had its first meeting.
-
-For deeper funnel milestones:
-  - "SQL / Functional Win reached" → dealstage IN: qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon, closedlost, 217786505
-  - "Demo / Value Win reached" → dealstage IN: presentationscheduled, 28218292, contractsent, closedwon, closedlost
-
-For contact-level funnel attribution (e.g. "leads from source X → MQL → first meeting"):
-1. Leads: contacts matching the source filter (createdate range + source property)
-2. MQL: associated Company has mql_date IS NOT NULL
-3. First meeting happened: associated Company has a deal in pipeline = default with dealstage IN (appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon, closedlost, 217786505, 175509306, 175526434)
+=== QUERY PLAYBOOKS ===
+${QUERY_PLAYBOOKS}
 
 RESPONSE RULES:
 - Call all tools silently — zero text output while fetching data
 - Only produce text ONCE as your final answer, using this exact structure:
 
-*Answer:* <the direct result — count, list, or value>
+**Answer:** <the direct result — count, list, or value>
 
-*Filters applied:*
+**Filters applied:**
 • <filter 1>
 • <filter 2>
 
-*Notes:* <only if something important needs flagging — skip if nothing to flag>
+**Notes:** <only if something important needs flagging>
+
+If there is nothing to flag, omit the **Notes:** line entirely — do not write "**Notes:** None" or "**Notes:** N/A".
 
 - Do NOT narrate your reasoning, show intermediate checks, or list records you rejected
 - Do NOT show ✅ / ❌ per record — only show records that matched
 - If listing matched records, show: name, stage, amount, and any other directly relevant fields
 - For result sets with more than 20 records, show a grouped summary (e.g. by stage, country, or source) with counts. Offer to list individual records if the user wants.
+- Do NOT prefix **Answer:** with any lead-in text ("Here's what I found:", "Sure, here's the breakdown:", etc.) and do NOT add a closing line after your last section ("Let me know if you need anything else!", "Happy to dig deeper if needed."). The response ends at the last populated section.
+- You may use a standard Markdown table (header row, a separator row of dashes, then data rows, all using | to separate columns) when tabular data is the clearest presentation — it renders as a real table in Slack. Use it for genuinely tabular comparisons; for simple lists, a numbered/bulleted list is still often clearer.
 
 SLACK FORMATTING RULES — follow strictly:
-- Bold: *text* (single asterisk, NOT double **)
+- Bold: **text** (double asterisk — standard Markdown, NOT Slack's classic single-asterisk mrkdwn)
 - Bullet lists: start lines with •
 - Numbered lists: 1. 2. 3.
-- NO markdown tables (no | pipes) — use numbered lists instead
-- NO ## or # headers — use *Bold Title* on its own line
+- Markdown tables ARE supported — use pipe (|) syntax when a table is the clearest format
+- NO ## or # headers — use **Bold Title** on its own line
 
 Always use tools to fetch actual data — never say you "don't have access".
 
 === SARAS BUSINESS CONTEXT ===
 ${SARAS_CONTEXT}
-${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}
-
-TODAY'S DATE: ${today}
-When the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.`;
+${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}`;
 }
 
 // Convert MCP tool format to Anthropic API format
@@ -157,203 +156,39 @@ const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
-// ─── Event Deduplication ─────────────────────────────────────────────────────
-
-const processedEvents = new Map();
-const DEDUP_TTL_MS = 60 * 1000;
-
-function isDuplicate(event) {
-  const eventId = event.client_msg_id || event.event_ts || event.ts;
-  if (!eventId) return false;
-  if (processedEvents.has(eventId)) return true;
-  processedEvents.set(eventId, Date.now());
-  if (processedEvents.size > 200) {
-    const cutoff = Date.now() - DEDUP_TTL_MS;
-    for (const [k, v] of processedEvents) {
-      if (v < cutoff) processedEvents.delete(k);
-      if (processedEvents.size <= 150) break;
-    }
-  }
-  return false;
-}
-
-// ─── Response Cache ───────────────────────────────────────────────────────────
-
-const responseCache = new Map();
-const CACHE_TTL_MS = 10 * 60 * 1000;
-
-function getCached(key) {
-  const e = responseCache.get(key);
-  if (!e || Date.now() - e.ts > CACHE_TTL_MS) { responseCache.delete(key); return null; }
-  return e;
-}
-function setCache(key, answer) {
-  if (responseCache.size >= 500) {
-    const cutoff = Date.now() - CACHE_TTL_MS / 2;
-    for (const [k, v] of responseCache) {
-      if (v.ts < cutoff) responseCache.delete(k);
-      if (responseCache.size < 400) break;
-    }
-  }
-  responseCache.set(key, { answer, ts: Date.now() });
-}
-
-// ─── Thread History Store ────────────────────────────────────────────────────
-
-const threadHistory = new Map();
-const HISTORY_TTL_MS = 30 * 60 * 1000;
-const MAX_HISTORY_MESSAGES = 40;
-
-function getThreadKey(event) {
-  if (event.thread_ts) return `${event.channel}:${event.thread_ts}`;
-  return `${event.channel}:${event.user || event.ts}`;
-}
-
-function getThreadMessages(threadKey) {
-  const entry = threadHistory.get(threadKey);
-  if (!entry || Date.now() - entry.ts > HISTORY_TTL_MS) {
-    threadHistory.delete(threadKey);
-    return [];
-  }
-  return entry.messages;
-}
-
-function compressHistory(messages) {
-  return messages.map((msg, i) => {
-    if (i >= messages.length - 4) return msg;
-    if (msg.role === 'user' && Array.isArray(msg.content)) {
-      return {
-        role: 'user',
-        content: msg.content.map(block => {
-          if (block.type === 'tool_result') {
-            try {
-              const parsed = JSON.parse(block.content);
-              const summary = { total: parsed.total };
-              if (parsed.returned !== undefined) summary.returned = parsed.returned;
-              if (parsed.truncated) summary.truncated = true;
-              if (parsed.error) summary.error = parsed.error;
-              return { ...block, content: JSON.stringify(summary) };
-            } catch { return block; }
-          }
-          return block;
-        })
-      };
-    }
-    return msg;
-  });
-}
-
-function storeThreadMessages(threadKey, messages) {
-  const compressed = compressHistory(messages);
-  const trimmed = compressed.length > MAX_HISTORY_MESSAGES
-    ? compressed.slice(-MAX_HISTORY_MESSAGES)
-    : compressed;
-  threadHistory.set(threadKey, { messages: trimmed, ts: Date.now() });
-}
-
-// ─── Thread Lock ─────────────────────────────────────────────────────────────
-
-const threadLocks = new Map();
-
-function withThreadLock(threadKey, fn) {
-  const prev = threadLocks.get(threadKey) || Promise.resolve();
-  const current = prev.then(fn, fn);
-  threadLocks.set(threadKey, current);
-  current.finally(() => {
-    if (threadLocks.get(threadKey) === current) threadLocks.delete(threadKey);
-  });
-  return current;
-}
-
-// ─── Status Message Phrases ───────────────────────────────────────────────────
-
-const TOOL_STATUS = {
-  get_object_properties: 'Reading the CRM schema...',
-  search_objects: 'Querying the pipeline...',
-  get_deals_with_company_properties: 'Pulling deals and accounts...',
-  get_contacts_with_company_properties: 'Pulling contacts and accounts...',
-  get_associations: 'Connecting the dots...',
-  get_contact: 'Fetching the record...',
-  get_deal: 'Fetching the record...',
-  get_company: 'Fetching the record...',
-  count_objects: 'Counting records...',
-};
-
-const FALLBACK_STATUSES = [
-  'Negotiating with HubSpot...',
-  'Herding the data...',
-  'Crunching the numbers...',
-  'Consulting the CRM oracle...',
-];
-let fallbackIdx = 0;
-
-// ─── Slack Block Builder ──────────────────────────────────────────────────────
-
-function buildAnswerBlocks(answer) {
-  const blocks = [];
-  let remaining = answer;
-  while (remaining.length > 2900) {
-    if (blocks.length >= 48) {
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '_Response truncated — ask me to narrow the results._' } });
-      return blocks;
-    }
-    const split = remaining.lastIndexOf('\n', 2900);
-    const cutAt = split > 1000 ? split : 2900;
-    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining.slice(0, cutAt) } });
-    remaining = remaining.slice(cutAt).trimStart();
-  }
-  if (remaining) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining } });
-  return blocks;
-}
-
-// ─── Slack HTTP Client ────────────────────────────────────────────────────────
-
-function slackRequest(endpoint, payload, token) {
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify(payload);
-    const options = {
-      hostname: 'slack.com',
-      port: 443,
-      path: `/api${endpoint}`,
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data)
-      }
-    };
-    const req = https.request(options, (res) => {
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(body);
-          if (!parsed.ok) reject(new Error(`Slack error: ${parsed.error}`));
-          else resolve(parsed);
-        } catch (e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
-    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Slack timeout')); });
-    req.write(data);
-    req.end();
-  });
-}
-
 // ─── Claude via Anthropic SDK ────────────────────────────────────────────────
+
+function emptyUsage() {
+  return { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+}
+
+function addUsage(totals, usage) {
+  if (!usage) return;
+  totals.input_tokens += usage.input_tokens || 0;
+  totals.output_tokens += usage.output_tokens || 0;
+  totals.cache_read_input_tokens += usage.cache_read_input_tokens || 0;
+  totals.cache_creation_input_tokens += usage.cache_creation_input_tokens || 0;
+}
 
 async function askClaude(question, threadKey, statusUpdater = async () => {}) {
   await statusUpdater('Analyzing your request...');
 
   const history = getThreadMessages(threadKey);
   const hasHistory = history.length > 0;
-  if (hasHistory) console.log(`[CLAUDE] Resuming thread ${threadKey} (${history.length} messages)`);
-  else console.log(`[CLAUDE] New thread ${threadKey}`);
+  log('INFO', 'thread_resume', { correlation_id: threadKey, resumed: hasHistory, historyLen: history.length });
 
   const messages = [...history, { role: 'user', content: question }];
+  const usage = emptyUsage();
 
+  const loopStartTs = Date.now();
+  const MAX_LOOP_MS = 100_000;
   let iterations = 0;
   while (iterations++ < 25) {
+    if (Date.now() - loopStartTs > MAX_LOOP_MS) {
+      log('WARN', 'agent_loop_time_exceeded', { correlation_id: threadKey, iterations, elapsedMs: Date.now() - loopStartTs });
+      storeThreadMessages(threadKey, messages);
+      return { text: 'This is taking too long — try narrowing your question.', usage };
+    }
     const response = await anthropic.messages.create({
       model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 16000,
@@ -362,6 +197,7 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
       tools: anthropicTools,
       messages,
     });
+    addUsage(usage, response.usage);
 
     const contentWithoutThinking = response.content.filter(b => b.type !== 'thinking');
     messages.push({ role: 'assistant', content: contentWithoutThinking });
@@ -370,52 +206,72 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
     if (response.stop_reason === 'end_turn' || toolBlocks.length === 0) {
       storeThreadMessages(threadKey, messages);
       const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-      return text || 'No response generated.';
+      return { text: text || 'No response generated.', usage };
     }
 
     const toolResults = [];
     for (const block of toolBlocks) {
-      const statusText = TOOL_STATUS[block.name] || FALLBACK_STATUSES[fallbackIdx++ % FALLBACK_STATUSES.length];
-      console.log(`[CLAUDE] Tool: ${block.name}`);
-      await statusUpdater(statusText);
-      const result = await executeTool(block.name, block.input);
+      log('INFO', 'tool_use', { correlation_id: threadKey, tool: block.name });
+      await statusUpdater(getToolStatus(block.name));
+      const result = await executeTool(block.name, block.input, { correlation_id: threadKey });
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
     }
     messages.push({ role: 'user', content: toolResults });
   }
 
+  log('WARN', 'agent_loop_iteration_cap', { correlation_id: threadKey, iterations, question });
   storeThreadMessages(threadKey, messages);
-  return 'Reached maximum iterations — try a more specific question.';
+
+  const FALLBACK_TEXT = 'Reached maximum iterations — try a more specific question.';
+  try {
+    const summaryResp = await anthropic.messages.create({
+      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
+      max_tokens: 2000,
+      system: buildSystemPrompt('You have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the **Answer:** / **Filters applied:** / **Notes:** structure, but replace **Answer:** with **Partial answer (ran out of steps):** and use **Notes:** to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).'),
+      tools: anthropicTools,
+      tool_choice: { type: 'none' },
+      messages,
+    });
+    addUsage(usage, summaryResp.usage);
+    const text = summaryResp.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+    return { text: text || FALLBACK_TEXT, usage };
+  } catch (err) {
+    log('ERROR', 'partial_progress_summary_failed', { correlation_id: threadKey, error: err.message });
+    return { text: FALLBACK_TEXT, usage };
+  }
 }
 
 function trimToAnswer(text) {
-  const match = text.match(/(\*Answer:|Answer:)/);
+  const match = text.match(/(\*\*Answer:|\*Answer:|Answer:)/);
   return match ? text.slice(match.index) : text;
 }
 
 // ─── Event Processor ──────────────────────────────────────────────────────────
 
 let shuttingDown = false;
+const startTs = Date.now();
+let lastInvocationTs = null;
 
 async function processEvent(event, slackToken) {
   if (shuttingDown) return;
-  console.log('[PROCESS] event:', event.type, 'channel:', event.channel);
 
   const isMention = event.type === 'app_mention';
   const isDM = event.type === 'message' && event.channel_type === 'im';
   if (!isMention && !isDM) return;
 
+  const threadKey = getThreadKey(event);
+  log('INFO', 'event_received', { correlation_id: threadKey, eventType: event.type, channel: event.channel });
+
   if (isDuplicate(event)) {
-    console.log('[PROCESS] Duplicate event, skipping');
+    log('INFO', 'event_duplicate', { correlation_id: threadKey });
     return;
   }
 
   const question = event.text?.replace(/<@[A-Z0-9]+>/g, '').trim();
   if (!question) return;
 
-  console.log('[PROCESS] Question:', question);
-
-  const threadKey = getThreadKey(event);
+  lastInvocationTs = new Date().toISOString();
+  log('INFO', 'question_received', { correlation_id: threadKey, question });
 
   slackRequest('/reactions.add', {
     channel: event.channel,
@@ -423,14 +279,14 @@ async function processEvent(event, slackToken) {
     name: 'eyes'
   }, slackToken).catch(() => {});
 
-  await withThreadLock(threadKey, async () => {
+  const lockResult = await withThreadLock(threadKey, async () => {
     const hasHistory = getThreadMessages(threadKey).length > 0;
 
     const cacheKey = `${event.user || ''}:${event.channel}:${question.toLowerCase()}`;
     if (!hasHistory) {
       const cached = getCached(cacheKey);
       if (cached) {
-        console.log('[PROCESS] Cache hit');
+        log('INFO', 'cache_hit', { correlation_id: threadKey });
         const blocks = buildAnswerBlocks(cached.answer);
         blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_⚡ Cached result_' }] });
         await slackRequest('/chat.postMessage', {
@@ -438,7 +294,7 @@ async function processEvent(event, slackToken) {
           thread_ts: event.thread_ts || event.ts,
           text: cached.answer.slice(0, 200),
           blocks
-        }, slackToken).catch(err => console.error('[SLACK] Failed to post cached answer:', err.message));
+        }, slackToken).catch(err => log('ERROR', 'cached_answer_post_failed', { correlation_id: threadKey, error: err.message }));
         return;
       }
     }
@@ -452,7 +308,7 @@ async function processEvent(event, slackToken) {
       }, slackToken);
       statusTs = statusMsg.ts;
     } catch (err) {
-      console.error('[PROCESS] Failed to post status:', err.message);
+      log('ERROR', 'status_post_failed', { correlation_id: threadKey, error: err.message });
     }
 
     async function statusUpdater(text) {
@@ -461,34 +317,39 @@ async function processEvent(event, slackToken) {
         channel: event.channel,
         ts: statusTs,
         text
-      }, slackToken).catch(() => {});
+      }, slackToken).catch(err => log('WARN', 'status_update_failed', { correlation_id: threadKey, error: err.message }));
     }
 
     let answer;
+    let answerUsage = null;
     try {
-      answer = trimToAnswer(await askClaude(question, threadKey, statusUpdater));
+      const result = await askClaude(question, threadKey, statusUpdater);
+      answer = trimToAnswer(result.text);
+      answerUsage = result.usage;
     } catch (err) {
-      console.error('[PROCESS] Claude error:', err.message);
+      log('ERROR', 'claude_error', { correlation_id: threadKey, error: err.message });
       const raw = err.message || '';
       const limitMatch = raw.match(/you have reached your specified workspace api usage limits[^]*/i);
       if (limitMatch) {
         const detail = raw.match(/You will regain access[^".]*/i);
-        answer = `*API Usage Limit Reached*\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
+        answer = `**API Usage Limit Reached**\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
       } else {
-        answer = `*Error:* ${raw}`;
+        answer = `**Error:** ${raw}`;
       }
     } finally {
       if (statusTs) {
         await slackRequest('/chat.delete', {
           channel: event.channel,
           ts: statusTs
-        }, slackToken).catch(err => console.error('[SLACK] Failed to delete status:', err.message));
+        }, slackToken).catch(err => log('WARN', 'status_delete_failed', { correlation_id: threadKey, error: err.message }));
       }
     }
 
-    if (!hasHistory) setCache(cacheKey, answer);
+    const isClarification = answer.startsWith('🤔 **Need a bit more detail:**');
 
-    const blocks = buildAnswerBlocks(answer);
+    if (!hasHistory && !isClarification) setCache(cacheKey, answer);
+
+    const blocks = buildAnswerBlocks(answer, { skipFeedback: isClarification, usage: isClarification ? null : answerUsage });
 
     await slackRequest('/chat.postMessage', {
       channel: event.channel,
@@ -496,16 +357,25 @@ async function processEvent(event, slackToken) {
       text: answer.slice(0, 200),
       blocks
     }, slackToken).catch(err => {
-      console.error('[SLACK] Failed to post answer:', err.message);
+      log('ERROR', 'answer_post_failed', { correlation_id: threadKey, error: err.message });
       slackRequest('/chat.postMessage', {
         channel: event.channel,
         thread_ts: event.thread_ts || event.ts,
         text: 'Sorry, I had trouble formatting that response. Please try rephrasing your question.'
-      }, slackToken).catch(() => {});
+      }, slackToken).catch(err2 => {
+        log('ERROR', 'fallback_post_failed', { correlation_id: threadKey, error: err2.message });
+        const logChannel = process.env.LOG_CHANNEL_ID;
+        if (logChannel) {
+          slackRequest('/chat.postMessage', {
+            channel: logChannel,
+            text: `:rotating_light: Bot failed to answer <@${event.user}> in <#${event.channel}> (thread ${threadKey}) — both primary and fallback post failed. Error: ${err2.message}`
+          }, slackToken).catch(err3 => log('ERROR', 'admin_escalation_failed', { correlation_id: threadKey, error: err3.message }));
+        }
+      });
     });
 
     slackRequest('/reactions.remove', { channel: event.channel, timestamp: event.ts, name: 'eyes' }, slackToken).catch(() => {});
-    slackRequest('/reactions.add', { channel: event.channel, timestamp: event.ts, name: 'white_check_mark' }, slackToken).catch(() => {});
+    slackRequest('/reactions.add', { channel: event.channel, timestamp: event.ts, name: isClarification ? 'question' : 'white_check_mark' }, slackToken).catch(() => {});
 
     const logChannel = process.env.LOG_CHANNEL_ID;
     if (logChannel && event.user) {
@@ -515,17 +385,29 @@ async function processEvent(event, slackToken) {
         text: `*Q* from <@${event.user}> in <#${event.channel}>\n*Question:* ${question}\n*Answer:* ${answerSnippet}${answer.length > 300 ? '...' : ''}`,
         unfurl_links: false,
         unfurl_media: false
-      }, slackToken).catch(() => {});
+      }, slackToken).catch(err => log('WARN', 'qa_log_post_failed', { correlation_id: threadKey, error: err.message }));
     }
 
-    console.log('[PROCESS] Done');
+    log('INFO', 'request_complete', { correlation_id: threadKey });
   });
+
+  if (lockResult && lockResult.__lockTimedOut) {
+    slackRequest('/chat.postMessage', {
+      channel: event.channel,
+      thread_ts: event.thread_ts || event.ts,
+      text: 'This is taking longer than expected — please try again in a moment.'
+    }, slackToken).catch(err => log('ERROR', 'lock_timeout_notice_failed', { correlation_id: threadKey, error: err.message }));
+  }
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => res.json({
   status: 'ok',
+  uptime_seconds: Math.floor((Date.now() - startTs) / 1000),
+  last_invocation_ts: lastInvocationTs,
+  active_threads: getActiveThreadCount(),
+  thread_history_count: getThreadHistoryCount(),
   env: {
     hasHubspot: !!process.env.HUBSPOT_PRIVATE_APP_TOKEN,
     hasAnthropic: !!process.env.ANTHROPIC_API_KEY,
@@ -548,7 +430,7 @@ app.post('/process', async (req, res) => {
 
   res.status(200).json({ queued: true });
 
-  processEvent(event, token).catch(err => console.error('[WORKER ERROR]', err.message));
+  processEvent(event, token).catch(err => log('ERROR', 'webhook_process_error', { error: err.message }));
 });
 
 app.post('/clear-history', (req, res) => {
@@ -556,13 +438,12 @@ app.post('/clear-history', (req, res) => {
   if (workerSecret && req.headers['x-worker-secret'] !== workerSecret) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  const count = threadHistory.size;
-  threadHistory.clear();
-  console.log(`[WORKER] Cleared ${count} thread histories`);
+  const count = clearThreadHistory();
+  log('INFO', 'thread_history_cleared', { count });
   res.json({ cleared: count });
 });
 
-const httpServer = app.listen(PORT, () => console.log(`[WORKER] Listening on port ${PORT}`));
+const httpServer = app.listen(PORT, () => log('INFO', 'worker_listening', { port: PORT }));
 
 // ─── Slack Socket Mode (bolt) ─────────────────────────────────────────────────
 
@@ -577,27 +458,45 @@ if (process.env.SLACK_APP_TOKEN) {
   slackApp.event('app_mention', async ({ event }) => {
     if (event.bot_id || event.subtype) return;
     processEvent(event, process.env.SLACK_BOT_TOKEN)
-      .catch(err => console.error('[BOLT] app_mention error:', err.message));
+      .catch(err => log('ERROR', 'bolt_app_mention_error', { error: err.message }));
   });
 
   slackApp.event('message', async ({ event }) => {
     if (event.channel_type === 'im' && !event.bot_id && !event.subtype) {
       processEvent(event, process.env.SLACK_BOT_TOKEN)
-        .catch(err => console.error('[BOLT] message error:', err.message));
+        .catch(err => log('ERROR', 'bolt_message_error', { error: err.message }));
+    }
+  });
+
+  slackApp.action('feedback', async ({ ack, body, action }) => {
+    await ack();
+    const value = action.value; // 'good-feedback' | 'bad-feedback'
+    log('INFO', 'feedback_received', {
+      value,
+      user: body.user && body.user.id,
+      channel: body.channel && body.channel.id,
+      message_ts: body.message && body.message.ts,
+    });
+    const logChannel = process.env.LOG_CHANNEL_ID;
+    if (logChannel) {
+      slackRequest('/chat.postMessage', {
+        channel: logChannel,
+        text: `${value === 'good-feedback' ? '👍' : '👎'} Feedback from <@${body.user.id}> on <#${body.channel.id}|${body.message.ts}>`
+      }, process.env.SLACK_BOT_TOKEN).catch(err => log('WARN', 'feedback_log_post_failed', { error: err.message }));
     }
   });
 
   slackApp.start()
-    .then(() => console.log('[WORKER] Socket Mode active'))
-    .catch(err => console.error('[WORKER] Socket Mode failed to start:', err.message));
+    .then(() => log('INFO', 'socket_mode_active', {}))
+    .catch(err => log('ERROR', 'socket_mode_start_failed', { error: err.message }));
 } else {
-  console.log('[WORKER] No SLACK_APP_TOKEN — Socket Mode disabled, using Vercel webhook');
+  log('INFO', 'socket_mode_disabled', { reason: 'no SLACK_APP_TOKEN, using Vercel webhook' });
 }
 
 // ─── Graceful Shutdown ──────────────────────────────────────────────────────
 
 process.on('SIGTERM', () => {
-  console.log('[WORKER] SIGTERM received, draining...');
+  log('INFO', 'sigterm_received', {});
   shuttingDown = true;
   httpServer.close();
   setTimeout(() => process.exit(0), 25000);
