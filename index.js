@@ -18,8 +18,17 @@ const anthropic = new Anthropic();
 const SARAS_CONTEXT = fs.readFileSync(path.join(__dirname, 'saras_context.md'), 'utf8');
 const QUERY_PLAYBOOKS = fs.readFileSync(path.join(__dirname, 'query_playbooks.md'), 'utf8');
 
-function buildSystemPrompt() {
+function buildSystemPrompt(addendum = null) {
   const today = new Date().toISOString().split('T')[0];
+  const blocks = [
+    { type: 'text', text: buildStaticPromptBody(), cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: `TODAY'S DATE: ${today}\nWhen the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.` },
+  ];
+  if (addendum) blocks.push({ type: 'text', text: addendum });
+  return blocks;
+}
+
+function buildStaticPromptBody() {
   return `You are a HubSpot CRM assistant for Saras Analytics. Responses are shown in Slack.
 
 === CRITICAL QUERY RULES ===
@@ -118,10 +127,7 @@ Always use tools to fetch actual data — never say you "don't have access".
 
 === SARAS BUSINESS CONTEXT ===
 ${SARAS_CONTEXT}
-${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}
-
-TODAY'S DATE: ${today}
-When the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.`;
+${process.env.BUSINESS_CONTEXT ? `\nADDITIONAL CONTEXT:\n${process.env.BUSINESS_CONTEXT}\n` : ''}`;
 }
 
 // Convert MCP tool format to Anthropic API format
@@ -431,7 +437,7 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
     const summaryResp = await anthropic.messages.create({
       model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 2000,
-      system: buildSystemPrompt() + '\n\nYou have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the *Answer:* / *Filters applied:* / *Notes:* structure, but replace *Answer:* with *Partial answer (ran out of steps):* and use *Notes:* to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).',
+      system: buildSystemPrompt('You have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the *Answer:* / *Filters applied:* / *Notes:* structure, but replace *Answer:* with *Partial answer (ran out of steps):* and use *Notes:* to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).'),
       tools: anthropicTools,
       tool_choice: { type: 'none' },
       messages,
