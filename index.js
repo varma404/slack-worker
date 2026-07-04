@@ -3,13 +3,25 @@
  */
 
 const express = require('express');
-const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const Anthropic = require('@anthropic-ai/sdk');
 const { App } = require('@slack/bolt');
 const { TOOLS: MCP_TOOLS, executeTool } = require('./hubspot-mcp-server');
 const { log } = require('./logger');
+const { slackRequest, buildAnswerBlocks, getToolStatus } = require('./slack-client');
+const {
+  isDuplicate,
+  getCached,
+  setCache,
+  getThreadKey,
+  getThreadMessages,
+  storeThreadMessages,
+  getThreadHistoryCount,
+  clearThreadHistory,
+  withThreadLock,
+  getActiveThreadCount,
+} = require('./thread-state');
 
 // ─── Claude Client & System Prompt ──────────────────────────────────────────
 
@@ -144,286 +156,6 @@ const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
-// ─── Event Deduplication ─────────────────────────────────────────────────────
-
-const processedEvents = new Map();
-const DEDUP_TTL_MS = 60 * 1000;
-
-function isDuplicate(event) {
-  const eventId = event.client_msg_id || event.event_ts || event.ts;
-  if (!eventId) return false;
-  if (processedEvents.has(eventId)) return true;
-  processedEvents.set(eventId, Date.now());
-  if (processedEvents.size > 200) {
-    const cutoff = Date.now() - DEDUP_TTL_MS;
-    for (const [k, v] of processedEvents) {
-      if (v < cutoff) processedEvents.delete(k);
-      if (processedEvents.size <= 150) break;
-    }
-  }
-  return false;
-}
-
-// ─── Response Cache ───────────────────────────────────────────────────────────
-
-const responseCache = new Map();
-const CACHE_TTL_MS = 10 * 60 * 1000;
-
-function getCached(key) {
-  const e = responseCache.get(key);
-  if (!e || Date.now() - e.ts > CACHE_TTL_MS) { responseCache.delete(key); return null; }
-  return e;
-}
-function setCache(key, answer) {
-  if (responseCache.size >= 500) {
-    const cutoff = Date.now() - CACHE_TTL_MS / 2;
-    for (const [k, v] of responseCache) {
-      if (v.ts < cutoff) responseCache.delete(k);
-      if (responseCache.size < 400) break;
-    }
-  }
-  responseCache.set(key, { answer, ts: Date.now() });
-}
-
-// ─── Thread History Store ────────────────────────────────────────────────────
-
-const threadHistory = new Map();
-const HISTORY_TTL_MS = 30 * 60 * 1000;
-const MAX_HISTORY_MESSAGES = 40;
-
-function getThreadKey(event) {
-  if (event.thread_ts) return `${event.channel}:${event.thread_ts}`;
-  return `${event.channel}:${event.user || event.ts}`;
-}
-
-function getThreadMessages(threadKey) {
-  const entry = threadHistory.get(threadKey);
-  if (!entry || Date.now() - entry.ts > HISTORY_TTL_MS) {
-    threadHistory.delete(threadKey);
-    return [];
-  }
-  return entry.messages;
-}
-
-function compressHistory(messages) {
-  return messages.map((msg, i) => {
-    if (i >= messages.length - 4) return msg;
-    if (msg.role === 'user' && Array.isArray(msg.content)) {
-      return {
-        role: 'user',
-        content: msg.content.map(block => {
-          if (block.type === 'tool_result') {
-            try {
-              const parsed = JSON.parse(block.content);
-              const summary = { total: parsed.total };
-              if (parsed.returned !== undefined) summary.returned = parsed.returned;
-              if (parsed.truncated) summary.truncated = true;
-              if (parsed.error) summary.error = parsed.error;
-              return { ...block, content: JSON.stringify(summary) };
-            } catch { return block; }
-          }
-          return block;
-        })
-      };
-    }
-    return msg;
-  });
-}
-
-function isToolResultMessage(msg) {
-  return msg.role === 'user' && Array.isArray(msg.content) &&
-    msg.content.some(b => b.type === 'tool_result');
-}
-
-function storeThreadMessages(threadKey, messages) {
-  const compressed = compressHistory(messages);
-  let trimmed = compressed;
-  if (compressed.length > MAX_HISTORY_MESSAGES) {
-    let start = compressed.length - MAX_HISTORY_MESSAGES;
-    // Never start the window on a tool_result message — that would orphan it
-    // from the tool_use block in the assistant message immediately before it.
-    while (start > 0 && isToolResultMessage(compressed[start])) start--;
-    trimmed = compressed.slice(start);
-  }
-  threadHistory.set(threadKey, { messages: trimmed, ts: Date.now() });
-}
-
-// ─── Thread Lock ─────────────────────────────────────────────────────────────
-
-const threadLocks = new Map();
-const LOCK_TIMEOUT_MS = 120_000; // generous: ~25 iterations x (HubSpot retries + Claude latency)
-
-// Races `fn` against a timeout so one wedged call can't block every later
-// message in the same thread forever. If the timeout wins, the lock slot is
-// released immediately; `fn` keeps running in the background (Node can't
-// cleanly cancel an in-flight HTTPS call) but its result is discarded —
-// the caller sees { __lockTimedOut: true } instead.
-function withThreadLock(threadKey, fn) {
-  const prev = threadLocks.get(threadKey) || Promise.resolve();
-  const run = prev.then(fn, fn);
-
-  const timeout = new Promise((resolve) => {
-    const t = setTimeout(() => {
-      log('ERROR', 'thread_lock_timeout', { correlation_id: threadKey });
-      resolve({ __lockTimedOut: true });
-    }, LOCK_TIMEOUT_MS);
-    run.finally(() => clearTimeout(t));
-  });
-
-  const current = Promise.race([run, timeout]);
-  // Queue position always resolves (never rejects) so the next call's
-  // `prev.then(fn, fn)` fires regardless of how this one settled.
-  const queuePosition = current.then(() => undefined, () => undefined);
-  threadLocks.set(threadKey, queuePosition);
-  queuePosition.finally(() => {
-    if (threadLocks.get(threadKey) === queuePosition) threadLocks.delete(threadKey);
-  });
-  return current;
-}
-
-// ─── Status Message Phrases ───────────────────────────────────────────────────
-
-const TOOL_STATUS = {
-  get_object_properties: 'Reading the CRM schema...',
-  search_objects: 'Querying the pipeline...',
-  get_deals_with_company_properties: 'Pulling deals and accounts...',
-  get_contacts_with_company_properties: 'Pulling contacts and accounts...',
-  get_associations: 'Connecting the dots...',
-  get_contact: 'Fetching the record...',
-  get_deal: 'Fetching the record...',
-  get_company: 'Fetching the record...',
-  count_objects: 'Counting records...',
-};
-
-const FALLBACK_STATUSES = [
-  'Negotiating with HubSpot...',
-  'Herding the data...',
-  'Crunching the numbers...',
-  'Consulting the CRM oracle...',
-];
-let fallbackIdx = 0;
-
-// ─── Slack Block Builder ──────────────────────────────────────────────────────
-
-// Approximate $/M-token rates. The raw Anthropic Messages API (unlike the
-// Claude Agent SDK) doesn't return a cost figure, so this is computed here.
-// Update if Anthropic's published pricing changes.
-const MODEL_RATES_PER_MTOK = {
-  'claude-sonnet-4-6': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-};
-const DEFAULT_RATES = MODEL_RATES_PER_MTOK['claude-sonnet-4-6'];
-
-function formatTokenCount(n) {
-  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
-  return String(n);
-}
-
-function estimateCostUsd(usage, model) {
-  const rates = MODEL_RATES_PER_MTOK[model] || DEFAULT_RATES;
-  return (
-    (usage.input_tokens / 1e6) * rates.input +
-    (usage.cache_read_input_tokens / 1e6) * rates.cacheRead +
-    (usage.cache_creation_input_tokens / 1e6) * rates.cacheWrite +
-    (usage.output_tokens / 1e6) * rates.output
-  );
-}
-
-function buildUsageFooter(usage) {
-  if (!usage) return null;
-  const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
-  const totalIn = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-  const cacheParts = [];
-  if (usage.cache_read_input_tokens) cacheParts.push(`${formatTokenCount(usage.cache_read_input_tokens)} cache read`);
-  if (usage.cache_creation_input_tokens) cacheParts.push(`${formatTokenCount(usage.cache_creation_input_tokens)} cache write`);
-  let inText = `${formatTokenCount(totalIn)} tokens in`;
-  if (cacheParts.length) inText += ` (${cacheParts.join(' · ')})`;
-  const cost = estimateCostUsd(usage, model);
-  return `${inText} · ${formatTokenCount(usage.output_tokens)} tokens out · $${cost.toFixed(4)}`;
-}
-
-function buildFeedbackBlock() {
-  return {
-    type: 'actions',
-    block_id: 'response_feedback',
-    elements: [
-      {
-        type: 'feedback_buttons',
-        action_id: 'feedback',
-        positive_button: {
-          text: { type: 'plain_text', text: 'Good Response' },
-          accessibility_label: 'Submit positive feedback',
-          value: 'good-feedback'
-        },
-        negative_button: {
-          text: { type: 'plain_text', text: 'Bad Response' },
-          accessibility_label: 'Submit negative feedback',
-          value: 'bad-feedback'
-        }
-      }
-    ]
-  };
-}
-
-// Uses Slack's native "markdown" block (standard CommonMark, incl. real
-// tables) rather than the classic "section"/"mrkdwn" block — see
-// SLACK FORMATTING RULES in the system prompt for the matching bold syntax.
-// Kept the same conservative 2900-char chunking as before the switch since
-// the markdown block's exact per-block limit isn't confirmed; splitting
-// smaller never hurts.
-function buildAnswerBlocks(answer, { skipFeedback = false, usage = null } = {}) {
-  const blocks = [];
-  let remaining = answer;
-  while (remaining.length > 2900) {
-    if (blocks.length >= 48) {
-      blocks.push({ type: 'markdown', text: '_Response truncated — ask me to narrow the results._' });
-      return blocks;
-    }
-    const split = remaining.lastIndexOf('\n', 2900);
-    const cutAt = split > 1000 ? split : 2900;
-    blocks.push({ type: 'markdown', text: remaining.slice(0, cutAt) });
-    remaining = remaining.slice(cutAt).trimStart();
-  }
-  if (remaining) blocks.push({ type: 'markdown', text: remaining });
-  const usageFooter = buildUsageFooter(usage);
-  if (usageFooter) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: usageFooter }] });
-  if (!skipFeedback) blocks.push(buildFeedbackBlock());
-  return blocks;
-}
-
-// ─── Slack HTTP Client ────────────────────────────────────────────────────────
-
-function slackRequest(endpoint, payload, token) {
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify(payload);
-    const options = {
-      hostname: 'slack.com',
-      port: 443,
-      path: `/api${endpoint}`,
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data)
-      }
-    };
-    const req = https.request(options, (res) => {
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(body);
-          if (!parsed.ok) reject(new Error(`Slack error: ${parsed.error}`));
-          else resolve(parsed);
-        } catch (e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
-    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Slack timeout')); });
-    req.write(data);
-    req.end();
-  });
-}
-
 // ─── Claude via Anthropic SDK ────────────────────────────────────────────────
 
 function emptyUsage() {
@@ -479,9 +211,8 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
 
     const toolResults = [];
     for (const block of toolBlocks) {
-      const statusText = TOOL_STATUS[block.name] || FALLBACK_STATUSES[fallbackIdx++ % FALLBACK_STATUSES.length];
       log('INFO', 'tool_use', { correlation_id: threadKey, tool: block.name });
-      await statusUpdater(statusText);
+      await statusUpdater(getToolStatus(block.name));
       const result = await executeTool(block.name, block.input, { correlation_id: threadKey });
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
     }
@@ -675,8 +406,8 @@ app.get('/health', (req, res) => res.json({
   status: 'ok',
   uptime_seconds: Math.floor((Date.now() - startTs) / 1000),
   last_invocation_ts: lastInvocationTs,
-  active_threads: threadLocks.size,
-  thread_history_count: threadHistory.size,
+  active_threads: getActiveThreadCount(),
+  thread_history_count: getThreadHistoryCount(),
   env: {
     hasHubspot: !!process.env.HUBSPOT_PRIVATE_APP_TOKEN,
     hasAnthropic: !!process.env.ANTHROPIC_API_KEY,
@@ -707,8 +438,7 @@ app.post('/clear-history', (req, res) => {
   if (workerSecret && req.headers['x-worker-secret'] !== workerSecret) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  const count = threadHistory.size;
-  threadHistory.clear();
+  const count = clearThreadHistory();
   log('INFO', 'thread_history_cleared', { count });
   res.json({ cleared: count });
 });
