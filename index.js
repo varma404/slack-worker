@@ -53,6 +53,24 @@ SCOPE RESTRICTION:
 You ONLY answer questions about HubSpot CRM data — deals, contacts, companies, pipelines, or Saras's sales and marketing activities.
 If a question is unrelated to HubSpot CRM (e.g. general company strategy, coding help, weather, internal ops tools, personal questions), respond with a brief, professional out-of-scope message. Keep it friendly, 2–3 sentences. Do NOT call any tools for out-of-scope questions.
 
+CLARIFICATION — WHEN TO ASK INSTEAD OF ANSWERING:
+Most questions have a clear best interpretation — resolve those yourself using the defaults and patterns in this prompt. Only ask a clarifying question when the ambiguity would silently change the numeric result or record set returned, AND no default below resolves it. Concretely, ask when:
+
+1. A company/person name in the question matches more than one HubSpot record and the records are meaningfully different (different domains, different deal stages) — do NOT ask if one match is an obvious best fit (exact name match vs. partial/fuzzy match) or the question doesn't care which one it is.
+2. A relative or informal time range is genuinely two-way ambiguous — e.g. "last quarter" when today is early in a quarter (could mean the quarter just ended or the one before), or "this week" said on a Monday close to a month boundary. Do NOT ask about "this month", "last 3 months", "this year" — those resolve unambiguously from TODAY'S DATE below.
+3. A metric or term has no definition in the Saras business context AND no established default in this prompt, AND more than one reasonable interpretation would change the result (e.g. "our best customers" — by revenue? by deal count? by tenure? there is no default). Do NOT ask for terms that ARE defined (MQL, ICP, SQL, funnel milestones) — use the definition.
+4. A count/list request is scoped to an object or property that could plausibly mean two different HubSpot objects with different answers (e.g. "how many deals do we have with Acme" could mean deals associated with the Acme company record, or deals where the deal name contains "Acme" — ask if a quick get_object_properties/search_objects check shows both readings would return different counts).
+
+When in doubt, prefer answering with your best interpretation and stating it explicitly in *Filters applied:* over asking — a stated assumption the user can correct is better than an interruption, UNLESS the ambiguity is a fork in what OBJECT or WHICH RECORD the entire query is about (name collision, metric definition), in which case ask.
+
+Ask AT MOST one question, offering the specific options you found (e.g. list the 2-3 matching companies with their domain/city to disambiguate). Never ask a vague "can you clarify?" — the question must name the specific fork and the concrete options.
+
+To ask a clarifying question: do not call any more tools. End your turn with text starting EXACTLY with:
+
+🤔 *Need a bit more detail:* <your specific question, naming the exact fork and options>
+
+Do NOT use this prefix for anything except a genuine blocking ambiguity. Do NOT use it to ask permission to run a query, confirm scope, or hedge — only when you cannot proceed without the user's choice.
+
 TOOL SELECTION RULES:
 - For "how many" / count questions, use count_objects — it returns exact totals without fetching records. For breakdowns by time period, call count_objects once per period.
 - For ANY question involving BOTH deals AND company properties (ICP status, company name, industry, revenue, etc.) → use get_deals_with_company_properties. This is a single batch call. Do NOT use get_associations one-by-one for this.
@@ -226,13 +244,32 @@ function storeThreadMessages(threadKey, messages) {
 // ─── Thread Lock ─────────────────────────────────────────────────────────────
 
 const threadLocks = new Map();
+const LOCK_TIMEOUT_MS = 120_000; // generous: ~25 iterations x (HubSpot retries + Claude latency)
 
+// Races `fn` against a timeout so one wedged call can't block every later
+// message in the same thread forever. If the timeout wins, the lock slot is
+// released immediately; `fn` keeps running in the background (Node can't
+// cleanly cancel an in-flight HTTPS call) but its result is discarded —
+// the caller sees { __lockTimedOut: true } instead.
 function withThreadLock(threadKey, fn) {
   const prev = threadLocks.get(threadKey) || Promise.resolve();
-  const current = prev.then(fn, fn);
-  threadLocks.set(threadKey, current);
-  current.finally(() => {
-    if (threadLocks.get(threadKey) === current) threadLocks.delete(threadKey);
+  const run = prev.then(fn, fn);
+
+  const timeout = new Promise((resolve) => {
+    const t = setTimeout(() => {
+      log('ERROR', 'thread_lock_timeout', { correlation_id: threadKey });
+      resolve({ __lockTimedOut: true });
+    }, LOCK_TIMEOUT_MS);
+    run.finally(() => clearTimeout(t));
+  });
+
+  const current = Promise.race([run, timeout]);
+  // Queue position always resolves (never rejects) so the next call's
+  // `prev.then(fn, fn)` fires regardless of how this one settled.
+  const queuePosition = current.then(() => undefined, () => undefined);
+  threadLocks.set(threadKey, queuePosition);
+  queuePosition.finally(() => {
+    if (threadLocks.get(threadKey) === queuePosition) threadLocks.delete(threadKey);
   });
   return current;
 }
@@ -347,8 +384,15 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
 
   const messages = [...history, { role: 'user', content: question }];
 
+  const loopStartTs = Date.now();
+  const MAX_LOOP_MS = 100_000;
   let iterations = 0;
   while (iterations++ < 25) {
+    if (Date.now() - loopStartTs > MAX_LOOP_MS) {
+      log('WARN', 'agent_loop_time_exceeded', { correlation_id: threadKey, iterations, elapsedMs: Date.now() - loopStartTs });
+      storeThreadMessages(threadKey, messages);
+      return 'This is taking too long — try narrowing your question.';
+    }
     const response = await anthropic.messages.create({
       model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 16000,
@@ -379,8 +423,25 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
     messages.push({ role: 'user', content: toolResults });
   }
 
+  log('WARN', 'agent_loop_iteration_cap', { correlation_id: threadKey, iterations, question });
   storeThreadMessages(threadKey, messages);
-  return 'Reached maximum iterations — try a more specific question.';
+
+  const FALLBACK_TEXT = 'Reached maximum iterations — try a more specific question.';
+  try {
+    const summaryResp = await anthropic.messages.create({
+      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
+      max_tokens: 2000,
+      system: buildSystemPrompt() + '\n\nYou have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the *Answer:* / *Filters applied:* / *Notes:* structure, but replace *Answer:* with *Partial answer (ran out of steps):* and use *Notes:* to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).',
+      tools: anthropicTools,
+      tool_choice: { type: 'none' },
+      messages,
+    });
+    const text = summaryResp.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+    return text || FALLBACK_TEXT;
+  } catch (err) {
+    log('ERROR', 'partial_progress_summary_failed', { correlation_id: threadKey, error: err.message });
+    return FALLBACK_TEXT;
+  }
 }
 
 function trimToAnswer(text) {
@@ -421,7 +482,7 @@ async function processEvent(event, slackToken) {
     name: 'eyes'
   }, slackToken).catch(() => {});
 
-  await withThreadLock(threadKey, async () => {
+  const lockResult = await withThreadLock(threadKey, async () => {
     const hasHistory = getThreadMessages(threadKey).length > 0;
 
     const cacheKey = `${event.user || ''}:${event.channel}:${question.toLowerCase()}`;
@@ -484,9 +545,11 @@ async function processEvent(event, slackToken) {
       }
     }
 
-    if (!hasHistory) setCache(cacheKey, answer);
+    const isClarification = answer.startsWith('🤔 *Need a bit more detail:*');
 
-    const blocks = buildAnswerBlocks(answer);
+    if (!hasHistory && !isClarification) setCache(cacheKey, answer);
+
+    const blocks = buildAnswerBlocks(answer, { skipFeedback: isClarification });
 
     await slackRequest('/chat.postMessage', {
       channel: event.channel,
@@ -512,7 +575,7 @@ async function processEvent(event, slackToken) {
     });
 
     slackRequest('/reactions.remove', { channel: event.channel, timestamp: event.ts, name: 'eyes' }, slackToken).catch(() => {});
-    slackRequest('/reactions.add', { channel: event.channel, timestamp: event.ts, name: 'white_check_mark' }, slackToken).catch(() => {});
+    slackRequest('/reactions.add', { channel: event.channel, timestamp: event.ts, name: isClarification ? 'question' : 'white_check_mark' }, slackToken).catch(() => {});
 
     const logChannel = process.env.LOG_CHANNEL_ID;
     if (logChannel && event.user) {
@@ -527,6 +590,14 @@ async function processEvent(event, slackToken) {
 
     log('INFO', 'request_complete', { correlation_id: threadKey });
   });
+
+  if (lockResult && lockResult.__lockTimedOut) {
+    slackRequest('/chat.postMessage', {
+      channel: event.channel,
+      thread_ts: event.thread_ts || event.ts,
+      text: 'This is taking longer than expected — please try again in a moment.'
+    }, slackToken).catch(err => log('ERROR', 'lock_timeout_notice_failed', { correlation_id: threadKey, error: err.message }));
+  }
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -595,6 +666,24 @@ if (process.env.SLACK_APP_TOKEN) {
     if (event.channel_type === 'im' && !event.bot_id && !event.subtype) {
       processEvent(event, process.env.SLACK_BOT_TOKEN)
         .catch(err => log('ERROR', 'bolt_message_error', { error: err.message }));
+    }
+  });
+
+  slackApp.action('feedback', async ({ ack, body, action }) => {
+    await ack();
+    const value = action.value; // 'good-feedback' | 'bad-feedback'
+    log('INFO', 'feedback_received', {
+      value,
+      user: body.user && body.user.id,
+      channel: body.channel && body.channel.id,
+      message_ts: body.message && body.message.ts,
+    });
+    const logChannel = process.env.LOG_CHANNEL_ID;
+    if (logChannel) {
+      slackRequest('/chat.postMessage', {
+        channel: logChannel,
+        text: `${value === 'good-feedback' ? '👍' : '👎'} Feedback from <@${body.user.id}> on <#${body.channel.id}|${body.message.ts}>`
+      }, process.env.SLACK_BOT_TOKEN).catch(err => log('WARN', 'feedback_log_post_failed', { error: err.message }));
     }
   });
 
