@@ -9,7 +9,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { App } = require('@slack/bolt');
 const { TOOLS: MCP_TOOLS, executeTool } = require('./hubspot-mcp-server');
 const { log } = require('./logger');
-const { slackRequest, buildAnswerBlocks, getToolStatus } = require('./slack-client');
+const { slackRequest, uploadFile, buildAnswerBlocks, getToolStatus } = require('./slack-client');
 const {
   isDuplicate,
   getCached,
@@ -129,6 +129,14 @@ If there is nothing to flag, omit the *Notes:* line entirely — do not write "*
 - If listing matched records, show: name, stage, amount, and any other directly relevant fields
 - For result sets with more than 20 records, show a grouped summary (e.g. by stage, country, or source) with counts. Offer to list individual records if the user wants.
 - Do NOT prefix *Answer:* with any lead-in text ("Here's what I found:", "Sure, here's the breakdown:", etc.) and do NOT add a closing line after your last section ("Let me know if you need anything else!", "Happy to dig deeper if needed."). The response ends at the last populated section.
+- When you list 3 or more individual records with multiple fields each (not a grouped summary), ALSO emit a tab-separated data block immediately after your *Filters applied:*/*Notes:* sections, using this exact delimiter format:
+
+===TSV_TABLE===
+Column1<TAB>Column2<TAB>Column3
+value1<TAB>value2<TAB>value3
+===END_TSV_TABLE===
+
+Use a real tab character between columns, one header row, one row per record, and the same fields you already chose to show in the text above. This becomes a downloadable table attachment — do not describe it or reference it in your answer text, just emit the block. Skip this block entirely for grouped summaries, single-record answers, or count-only answers.
 
 SLACK FORMATTING RULES — follow strictly:
 - Bold: *text* (single asterisk, NOT double **)
@@ -171,7 +179,7 @@ function addUsage(totals, usage) {
   totals.cache_creation_input_tokens += usage.cache_creation_input_tokens || 0;
 }
 
-async function askClaude(question, threadKey, statusUpdater = async () => {}) {
+async function askClaude(question, threadKey, statusUpdater = async () => {}, streamUpdater = async () => {}) {
   await statusUpdater('Analyzing your request...');
 
   const history = getThreadMessages(threadKey);
@@ -214,7 +222,9 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
     for (const block of toolBlocks) {
       log('INFO', 'tool_use', { correlation_id: threadKey, tool: block.name });
       await statusUpdater(getToolStatus(block.name));
+      await streamUpdater('start', block.name);
       const result = await executeTool(block.name, block.input, { correlation_id: threadKey });
+      await streamUpdater('complete', block.name, !result.error);
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
     }
     messages.push({ role: 'user', content: toolResults });
@@ -245,6 +255,16 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
 function trimToAnswer(text) {
   const match = text.match(/(\*\*Answer:|\*Answer:|Answer:)/);
   return match ? text.slice(match.index) : text;
+}
+
+// Pulls the optional ===TSV_TABLE===...===END_TSV_TABLE=== block (see the
+// RESPONSE RULES prompt section) out of the answer text so it can be
+// uploaded as a file attachment instead of rendered inline.
+function extractTsvTable(answer) {
+  const match = answer.match(/===TSV_TABLE===\n([\s\S]*?)\n===END_TSV_TABLE===/);
+  if (!match) return { text: answer, tsv: null };
+  const text = (answer.slice(0, match.index) + answer.slice(match.index + match[0].length)).trim();
+  return { text, tsv: match[1] };
 }
 
 // ─── Event Processor ──────────────────────────────────────────────────────────
@@ -300,26 +320,46 @@ async function processEvent(event, slackToken) {
       }
     }
 
-    // Socket Mode (Agents & AI Apps enabled) gets Slack's native rotating
-    // assistant status instead of a manual status message we have to
-    // create/update/delete ourselves. It auto-clears when we post the final
-    // answer (or after Slack's own 2-minute timeout), so there's no cleanup
-    // call needed on this path. The legacy webhook fallback (SLACK_APP_TOKEN
-    // unset) keeps the original chat.postMessage/chat.update/chat.delete
-    // flow untouched, since assistant.threads.setStatus is an AI-app-only
-    // capability tied to this Socket Mode app.
+    // Socket Mode (Agents & AI Apps enabled) tries the step-trace streaming
+    // UI (chat.startStream/appendStream/stopStream — "E4") first; if that
+    // call fails for any reason, it falls back to the simpler rotating
+    // assistant status ("E3", assistant.threads.setStatus) rather than
+    // leaving the user with a broken request — this surface is newer and
+    // less proven than the rest of the Slack Web API used elsewhere in this
+    // file. The legacy webhook fallback (SLACK_APP_TOKEN unset) keeps the
+    // original chat.postMessage/chat.update/chat.delete flow untouched,
+    // since neither streaming nor assistant status are reachable without
+    // Socket Mode's AI-app capability.
     const isAgentApp = !!process.env.SLACK_APP_TOKEN;
     const threadTs = event.thread_ts || event.ts;
 
     let statusTs = null;
+    let streamTs = null;
+    let toolStepCount = 0;
+
     if (isAgentApp) {
+      try {
+        const streamStart = await slackRequest('/chat.startStream', {
+          channel: event.channel,
+          thread_ts: threadTs,
+          task_display_mode: 'timeline'
+        }, slackToken);
+        streamTs = streamStart.ts;
+        log('INFO', 'stream_mode', { correlation_id: threadKey, mode: 'e4' });
+      } catch (err) {
+        log('WARN', 'stream_start_failed', { correlation_id: threadKey, error: err.message });
+      }
+    }
+
+    if (isAgentApp && !streamTs) {
+      log('INFO', 'stream_mode', { correlation_id: threadKey, mode: 'e3-fallback' });
       await slackRequest('/assistant.threads.setStatus', {
         channel_id: event.channel,
         thread_ts: threadTs,
         status: 'Analyzing your request...',
         loading_messages: ['Analyzing your request...', 'Reading the CRM schema...', 'Querying HubSpot...', 'Crunching the numbers...']
       }, slackToken).catch(err => log('ERROR', 'status_post_failed', { correlation_id: threadKey, error: err.message }));
-    } else {
+    } else if (!isAgentApp) {
       try {
         const statusMsg = await slackRequest('/chat.postMessage', {
           channel: event.channel,
@@ -333,6 +373,7 @@ async function processEvent(event, slackToken) {
     }
 
     async function statusUpdater(text) {
+      if (streamTs) return; // E4 mode: streamUpdater drives the visual instead
       if (isAgentApp) {
         await slackRequest('/assistant.threads.setStatus', {
           channel_id: event.channel,
@@ -349,10 +390,31 @@ async function processEvent(event, slackToken) {
       }, slackToken).catch(err => log('WARN', 'status_update_failed', { correlation_id: threadKey, error: err.message }));
     }
 
+    // Only active in E4 mode (streamTs set). Emits a task_update chunk pair
+    // per tool call — 'in_progress' when it starts, 'complete'/'error' when
+    // it finishes — producing the per-step accordion. Tool calls in this
+    // loop are sequential (never concurrent), so toolStepCount is a safe
+    // stable id across each pair.
+    async function streamUpdater(phase, toolName, ok) {
+      if (!streamTs) return;
+      if (phase === 'start') toolStepCount++;
+      const title = getToolStatus(toolName).replace(/\.\.\.$/, '');
+      await slackRequest('/chat.appendStream', {
+        channel: event.channel,
+        ts: streamTs,
+        chunks: [{
+          type: 'task_update',
+          id: String(toolStepCount),
+          title,
+          status: phase === 'start' ? 'in_progress' : (ok ? 'complete' : 'error')
+        }]
+      }, slackToken).catch(err => log('WARN', 'stream_append_failed', { correlation_id: threadKey, error: err.message }));
+    }
+
     let answer;
     let answerUsage = null;
     try {
-      const result = await askClaude(question, threadKey, statusUpdater);
+      const result = await askClaude(question, threadKey, statusUpdater, streamUpdater);
       answer = trimToAnswer(result.text);
       answerUsage = result.usage;
     } catch (err) {
@@ -376,16 +438,34 @@ async function processEvent(event, slackToken) {
 
     const isClarification = answer.startsWith('🤔 *Need a bit more detail:*');
 
+    let tsvTable = null;
+    if (!isClarification) {
+      const extracted = extractTsvTable(answer);
+      answer = extracted.text;
+      tsvTable = extracted.tsv;
+    }
+
     if (!hasHistory && !isClarification) setCache(cacheKey, answer);
 
     const blocks = buildAnswerBlocks(answer, { skipFeedback: isClarification, usage: isClarification ? null : answerUsage });
 
-    await slackRequest('/chat.postMessage', {
-      channel: event.channel,
-      thread_ts: event.thread_ts || event.ts,
-      text: answer.slice(0, 200),
-      blocks
-    }, slackToken).catch(err => {
+    // E4 mode finalizes the streaming message (step trace + final blocks in
+    // one message) via chat.stopStream instead of posting a new message.
+    const primaryPost = streamTs
+      ? slackRequest('/chat.stopStream', {
+          channel: event.channel,
+          ts: streamTs,
+          chunks: [{ type: 'plan_update', title: `Completed (${toolStepCount} step${toolStepCount === 1 ? '' : 's'})` }],
+          blocks
+        }, slackToken)
+      : slackRequest('/chat.postMessage', {
+          channel: event.channel,
+          thread_ts: event.thread_ts || event.ts,
+          text: answer.slice(0, 200),
+          blocks
+        }, slackToken);
+
+    await primaryPost.catch(err => {
       log('ERROR', 'answer_post_failed', { correlation_id: threadKey, error: err.message });
       slackRequest('/chat.postMessage', {
         channel: event.channel,
@@ -402,6 +482,13 @@ async function processEvent(event, slackToken) {
         }
       });
     });
+
+    if (tsvTable) {
+      uploadFile('hubspot-export.tsv', tsvTable, {
+        channelId: event.channel,
+        threadTs: event.thread_ts || event.ts,
+      }, slackToken).catch(err => log('WARN', 'tsv_upload_failed', { correlation_id: threadKey, error: err.message }));
+    }
 
     slackRequest('/reactions.remove', { channel: event.channel, timestamp: event.ts, name: 'eyes' }, slackToken).catch(() => {});
     slackRequest('/reactions.add', { channel: event.channel, timestamp: event.ts, name: isClarification ? 'question' : 'white_check_mark' }, slackToken).catch(() => {});
