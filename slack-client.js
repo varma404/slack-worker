@@ -107,8 +107,13 @@ function buildUsageFooter(usage) {
 // ─── Slack Block Builder ──────────────────────────────────────────────────────
 
 function buildFeedbackBlock() {
+  // Slack requires feedback_buttons to be nested in a context_actions block,
+  // not a plain actions block — a plain actions block causes Slack to reject
+  // the entire message with "invalid_blocks". This was the real cause of
+  // every answer failing to post since this block was first added; the
+  // "markdown" block investigated earlier was an unrelated red herring.
   return {
-    type: 'actions',
+    type: 'context_actions',
     block_id: 'response_feedback',
     elements: [
       {
