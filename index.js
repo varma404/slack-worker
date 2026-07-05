@@ -84,13 +84,13 @@ Most questions have a clear best interpretation — resolve those yourself using
 3. A metric or term has no definition in the Saras business context AND no established default in this prompt, AND more than one reasonable interpretation would change the result (e.g. "our best customers" — by revenue? by deal count? by tenure? there is no default). Do NOT ask for terms that ARE defined (MQL, ICP, SQL, funnel milestones) — use the definition.
 4. A count/list request is scoped to an object or property that could plausibly mean two different HubSpot objects with different answers (e.g. "how many deals do we have with Acme" could mean deals associated with the Acme company record, or deals where the deal name contains "Acme" — ask if a quick get_object_properties/search_objects check shows both readings would return different counts).
 
-When in doubt, prefer answering with your best interpretation and stating it explicitly in **Filters applied:** over asking — a stated assumption the user can correct is better than an interruption, UNLESS the ambiguity is a fork in what OBJECT or WHICH RECORD the entire query is about (name collision, metric definition), in which case ask.
+When in doubt, prefer answering with your best interpretation and stating it explicitly in *Filters applied:* over asking — a stated assumption the user can correct is better than an interruption, UNLESS the ambiguity is a fork in what OBJECT or WHICH RECORD the entire query is about (name collision, metric definition), in which case ask.
 
 Ask AT MOST one question, offering the specific options you found (e.g. list the 2-3 matching companies with their domain/city to disambiguate). Never ask a vague "can you clarify?" — the question must name the specific fork and the concrete options.
 
 To ask a clarifying question: do not call any more tools. End your turn with text starting EXACTLY with:
 
-🤔 **Need a bit more detail:** <your specific question, naming the exact fork and options>
+🤔 *Need a bit more detail:* <your specific question, naming the exact fork and options>
 
 Do NOT use this prefix for anything except a genuine blocking ambiguity. Do NOT use it to ask permission to run a query, confirm scope, or hedge — only when you cannot proceed without the user's choice.
 
@@ -114,29 +114,28 @@ RESPONSE RULES:
 - Call all tools silently — zero text output while fetching data
 - Only produce text ONCE as your final answer, using this exact structure:
 
-**Answer:** <the direct result — count, list, or value>
+*Answer:* <the direct result — count, list, or value>
 
-**Filters applied:**
+*Filters applied:*
 • <filter 1>
 • <filter 2>
 
-**Notes:** <only if something important needs flagging>
+*Notes:* <only if something important needs flagging>
 
-If there is nothing to flag, omit the **Notes:** line entirely — do not write "**Notes:** None" or "**Notes:** N/A".
+If there is nothing to flag, omit the *Notes:* line entirely — do not write "*Notes:* None" or "*Notes:* N/A".
 
 - Do NOT narrate your reasoning, show intermediate checks, or list records you rejected
 - Do NOT show ✅ / ❌ per record — only show records that matched
 - If listing matched records, show: name, stage, amount, and any other directly relevant fields
 - For result sets with more than 20 records, show a grouped summary (e.g. by stage, country, or source) with counts. Offer to list individual records if the user wants.
-- Do NOT prefix **Answer:** with any lead-in text ("Here's what I found:", "Sure, here's the breakdown:", etc.) and do NOT add a closing line after your last section ("Let me know if you need anything else!", "Happy to dig deeper if needed."). The response ends at the last populated section.
-- You may use a standard Markdown table (header row, a separator row of dashes, then data rows, all using | to separate columns) when tabular data is the clearest presentation — it renders as a real table in Slack. Use it for genuinely tabular comparisons; for simple lists, a numbered/bulleted list is still often clearer.
+- Do NOT prefix *Answer:* with any lead-in text ("Here's what I found:", "Sure, here's the breakdown:", etc.) and do NOT add a closing line after your last section ("Let me know if you need anything else!", "Happy to dig deeper if needed."). The response ends at the last populated section.
 
 SLACK FORMATTING RULES — follow strictly:
-- Bold: **text** (double asterisk — standard Markdown, NOT Slack's classic single-asterisk mrkdwn)
+- Bold: *text* (single asterisk, NOT double **)
 - Bullet lists: start lines with •
 - Numbered lists: 1. 2. 3.
-- Markdown tables ARE supported — use pipe (|) syntax when a table is the clearest format
-- NO ## or # headers — use **Bold Title** on its own line
+- NO markdown tables (no | pipes) — use numbered lists instead
+- NO ## or # headers — use *Bold Title* on its own line
 
 Always use tools to fetch actual data — never say you "don't have access".
 
@@ -229,7 +228,7 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
     const summaryResp = await anthropic.messages.create({
       model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 2000,
-      system: buildSystemPrompt('You have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the **Answer:** / **Filters applied:** / **Notes:** structure, but replace **Answer:** with **Partial answer (ran out of steps):** and use **Notes:** to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).'),
+      system: buildSystemPrompt('You have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the *Answer:* / *Filters applied:* / *Notes:* structure, but replace *Answer:* with *Partial answer (ran out of steps):* and use *Notes:* to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).'),
       tools: anthropicTools,
       tool_choice: { type: 'none' },
       messages,
@@ -334,9 +333,9 @@ async function processEvent(event, slackToken) {
       const limitMatch = raw.match(/you have reached your specified workspace api usage limits[^]*/i);
       if (limitMatch) {
         const detail = raw.match(/You will regain access[^".]*/i);
-        answer = `**API Usage Limit Reached**\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
+        answer = `*API Usage Limit Reached*\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
       } else {
-        answer = `**Error:** ${raw}`;
+        answer = `*Error:* ${raw}`;
       }
     } finally {
       if (statusTs) {
@@ -347,7 +346,7 @@ async function processEvent(event, slackToken) {
       }
     }
 
-    const isClarification = answer.startsWith('🤔 **Need a bit more detail:**');
+    const isClarification = answer.startsWith('🤔 *Need a bit more detail:*');
 
     if (!hasHistory && !isClarification) setCache(cacheKey, answer);
 

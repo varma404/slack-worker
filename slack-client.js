@@ -129,26 +129,27 @@ function buildFeedbackBlock() {
   };
 }
 
-// Uses Slack's native "markdown" block (standard CommonMark, incl. real
-// tables) rather than the classic "section"/"mrkdwn" block — see
-// SLACK FORMATTING RULES in the system prompt for the matching bold syntax.
-// Kept the same conservative 2900-char chunking as before the switch since
-// the markdown block's exact per-block limit isn't confirmed; splitting
-// smaller never hurts.
+// NOTE: reverted from Slack's native "markdown" block back to the classic
+// "section"/"mrkdwn" block — the markdown block returned "invalid_blocks"
+// in production even after switching the Slack app to an AI/Agent app with
+// assistant:write, confirmed via two separate live tests. Root cause still
+// unconfirmed; not worth blocking answer delivery on it. Real pipe-table
+// rendering is not available with mrkdwn — see SLACK FORMATTING RULES in
+// the system prompt, which was reverted to single-asterisk bold to match.
 function buildAnswerBlocks(answer, { skipFeedback = false, usage = null } = {}) {
   const blocks = [];
   let remaining = answer;
   while (remaining.length > 2900) {
     if (blocks.length >= 48) {
-      blocks.push({ type: 'markdown', text: '_Response truncated — ask me to narrow the results._' });
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '_Response truncated — ask me to narrow the results._' } });
       return blocks;
     }
     const split = remaining.lastIndexOf('\n', 2900);
     const cutAt = split > 1000 ? split : 2900;
-    blocks.push({ type: 'markdown', text: remaining.slice(0, cutAt) });
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining.slice(0, cutAt) } });
     remaining = remaining.slice(cutAt).trimStart();
   }
-  if (remaining) blocks.push({ type: 'markdown', text: remaining });
+  if (remaining) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining } });
   const usageFooter = buildUsageFooter(usage);
   if (usageFooter) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: usageFooter }] });
   if (!skipFeedback) blocks.push(buildFeedbackBlock());
