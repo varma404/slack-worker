@@ -9,7 +9,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { App } = require('@slack/bolt');
 const { TOOLS: MCP_TOOLS, executeTool } = require('./hubspot-mcp-server');
 const { log } = require('./logger');
-const { slackRequest, buildAnswerBlocks, getToolStatus } = require('./slack-client');
+const { slackRequest, uploadFile, buildAnswerBlocks, getToolStatus } = require('./slack-client');
 const {
   isDuplicate,
   getCached,
@@ -129,6 +129,14 @@ If there is nothing to flag, omit the *Notes:* line entirely — do not write "*
 - If listing matched records, show: name, stage, amount, and any other directly relevant fields
 - For result sets with more than 20 records, show a grouped summary (e.g. by stage, country, or source) with counts. Offer to list individual records if the user wants.
 - Do NOT prefix *Answer:* with any lead-in text ("Here's what I found:", "Sure, here's the breakdown:", etc.) and do NOT add a closing line after your last section ("Let me know if you need anything else!", "Happy to dig deeper if needed."). The response ends at the last populated section.
+- When you list 3 or more individual records with multiple fields each (not a grouped summary), ALSO emit a tab-separated data block immediately after your *Filters applied:*/*Notes:* sections, using this exact delimiter format:
+
+===TSV_TABLE===
+Column1<TAB>Column2<TAB>Column3
+value1<TAB>value2<TAB>value3
+===END_TSV_TABLE===
+
+Use a real tab character between columns, one header row, one row per record, and the same fields you already chose to show in the text above. This becomes a downloadable table attachment — do not describe it or reference it in your answer text, just emit the block. Skip this block entirely for grouped summaries, single-record answers, or count-only answers.
 
 SLACK FORMATTING RULES — follow strictly:
 - Bold: *text* (single asterisk, NOT double **)
@@ -245,6 +253,16 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}) {
 function trimToAnswer(text) {
   const match = text.match(/(\*\*Answer:|\*Answer:|Answer:)/);
   return match ? text.slice(match.index) : text;
+}
+
+// Pulls the optional ===TSV_TABLE===...===END_TSV_TABLE=== block (see the
+// RESPONSE RULES prompt section) out of the answer text so it can be
+// uploaded as a file attachment instead of rendered inline.
+function extractTsvTable(answer) {
+  const match = answer.match(/===TSV_TABLE===\n([\s\S]*?)\n===END_TSV_TABLE===/);
+  if (!match) return { text: answer, tsv: null };
+  const text = (answer.slice(0, match.index) + answer.slice(match.index + match[0].length)).trim();
+  return { text, tsv: match[1] };
 }
 
 // ─── Event Processor ──────────────────────────────────────────────────────────
@@ -376,6 +394,13 @@ async function processEvent(event, slackToken) {
 
     const isClarification = answer.startsWith('🤔 *Need a bit more detail:*');
 
+    let tsvTable = null;
+    if (!isClarification) {
+      const extracted = extractTsvTable(answer);
+      answer = extracted.text;
+      tsvTable = extracted.tsv;
+    }
+
     if (!hasHistory && !isClarification) setCache(cacheKey, answer);
 
     const blocks = buildAnswerBlocks(answer, { skipFeedback: isClarification, usage: isClarification ? null : answerUsage });
@@ -402,6 +427,13 @@ async function processEvent(event, slackToken) {
         }
       });
     });
+
+    if (tsvTable) {
+      uploadFile('hubspot-export.tsv', tsvTable, {
+        channelId: event.channel,
+        threadTs: event.thread_ts || event.ts,
+      }, slackToken).catch(err => log('WARN', 'tsv_upload_failed', { correlation_id: threadKey, error: err.message }));
+    }
 
     slackRequest('/reactions.remove', { channel: event.channel, timestamp: event.ts, name: 'eyes' }, slackToken).catch(() => {});
     slackRequest('/reactions.add', { channel: event.channel, timestamp: event.ts, name: isClarification ? 'question' : 'white_check_mark' }, slackToken).catch(() => {});

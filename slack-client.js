@@ -5,6 +5,7 @@
  */
 
 const https = require('https');
+const { WebClient } = require('@slack/web-api');
 
 // ─── Slack HTTP Client ────────────────────────────────────────────────────────
 
@@ -37,6 +38,31 @@ function slackRequest(endpoint, payload, token) {
     req.setTimeout(10000, () => { req.destroy(); reject(new Error('Slack timeout')); });
     req.write(data);
     req.end();
+  });
+}
+
+// ─── File Upload ──────────────────────────────────────────────────────────────
+
+// files.upload is sunset (Nov 2025); the current flow is a 3-call sequence
+// (files.getUploadURLExternal -> raw POST to the returned upload_url ->
+// files.completeUploadExternal). Using @slack/web-api's uploadV2 rather than
+// hand-rolling that sequence over raw https — it's already a transitive
+// dependency of @slack/bolt (now a direct one too) and handles the upload
+// encoding correctly, which isn't worth re-implementing by hand.
+const webClientCache = new Map();
+function getWebClient(token) {
+  if (!webClientCache.has(token)) webClientCache.set(token, new WebClient(token));
+  return webClientCache.get(token);
+}
+
+async function uploadFile(filename, content, { channelId, threadTs, comment } = {}, token) {
+  const client = getWebClient(token);
+  return client.files.uploadV2({
+    filename,
+    content,
+    channel_id: channelId,
+    thread_ts: threadTs,
+    initial_comment: comment,
   });
 }
 
@@ -163,6 +189,7 @@ function buildAnswerBlocks(answer, { skipFeedback = false, usage = null } = {}) 
 
 module.exports = {
   slackRequest,
+  uploadFile,
   buildAnswerBlocks,
   getToolStatus,
 };
