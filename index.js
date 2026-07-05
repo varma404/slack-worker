@@ -300,19 +300,47 @@ async function processEvent(event, slackToken) {
       }
     }
 
+    // Socket Mode (Agents & AI Apps enabled) gets Slack's native rotating
+    // assistant status instead of a manual status message we have to
+    // create/update/delete ourselves. It auto-clears when we post the final
+    // answer (or after Slack's own 2-minute timeout), so there's no cleanup
+    // call needed on this path. The legacy webhook fallback (SLACK_APP_TOKEN
+    // unset) keeps the original chat.postMessage/chat.update/chat.delete
+    // flow untouched, since assistant.threads.setStatus is an AI-app-only
+    // capability tied to this Socket Mode app.
+    const isAgentApp = !!process.env.SLACK_APP_TOKEN;
+    const threadTs = event.thread_ts || event.ts;
+
     let statusTs = null;
-    try {
-      const statusMsg = await slackRequest('/chat.postMessage', {
-        channel: event.channel,
-        thread_ts: event.thread_ts || event.ts,
-        text: 'Analyzing your request...'
-      }, slackToken);
-      statusTs = statusMsg.ts;
-    } catch (err) {
-      log('ERROR', 'status_post_failed', { correlation_id: threadKey, error: err.message });
+    if (isAgentApp) {
+      await slackRequest('/assistant.threads.setStatus', {
+        channel_id: event.channel,
+        thread_ts: threadTs,
+        status: 'Analyzing your request...',
+        loading_messages: ['Analyzing your request...', 'Reading the CRM schema...', 'Querying HubSpot...', 'Crunching the numbers...']
+      }, slackToken).catch(err => log('ERROR', 'status_post_failed', { correlation_id: threadKey, error: err.message }));
+    } else {
+      try {
+        const statusMsg = await slackRequest('/chat.postMessage', {
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: 'Analyzing your request...'
+        }, slackToken);
+        statusTs = statusMsg.ts;
+      } catch (err) {
+        log('ERROR', 'status_post_failed', { correlation_id: threadKey, error: err.message });
+      }
     }
 
     async function statusUpdater(text) {
+      if (isAgentApp) {
+        await slackRequest('/assistant.threads.setStatus', {
+          channel_id: event.channel,
+          thread_ts: threadTs,
+          status: text
+        }, slackToken).catch(err => log('WARN', 'status_update_failed', { correlation_id: threadKey, error: err.message }));
+        return;
+      }
       if (!statusTs) return;
       await slackRequest('/chat.update', {
         channel: event.channel,
