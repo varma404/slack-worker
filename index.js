@@ -26,8 +26,11 @@ const {
 // ─── Startup Validation ─────────────────────────────────────────────────────
 // Fail fast and loud on misconfiguration rather than silently degrading
 // behavior. Socket Mode is the only supported architecture — every one of
-// these is required for the process to do anything useful.
-const REQUIRED_ENV_VARS = ['SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'ANTHROPIC_API_KEY', 'HUBSPOT_PRIVATE_APP_TOKEN'];
+// these is required for the process to do anything useful. Note:
+// SLACK_SIGNING_SECRET is NOT required here — Bolt only enforces it for the
+// default HTTP receiver's signature verification; the Socket Mode receiver
+// (socketMode: true, used exclusively below) never needs it.
+const REQUIRED_ENV_VARS = ['SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN', 'ANTHROPIC_API_KEY', 'HUBSPOT_PRIVATE_APP_TOKEN'];
 const missingEnvVars = REQUIRED_ENV_VARS.filter(name => !process.env[name]);
 if (missingEnvVars.length > 0) {
   log('ERROR', 'missing_required_env_vars', { missing: missingEnvVars });

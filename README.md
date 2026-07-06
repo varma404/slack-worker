@@ -12,10 +12,9 @@ At [api.slack.com/apps](https://api.slack.com/apps), for this app:
 
 1. **Enable Socket Mode** (Settings → Socket Mode) and generate an app-level token (`xapp-...`) → `SLACK_APP_TOKEN`.
 2. **Install the app to your workspace** and copy the Bot User OAuth Token (`xoxb-...`) → `SLACK_BOT_TOKEN`.
-3. **Copy the Signing Secret** (Basic Information → App Credentials) → `SLACK_SIGNING_SECRET`.
-4. **Subscribe to bot events**: `app_mention`, `message.im`.
-5. **Event Subscriptions → Request URL must be empty/unset.** Socket Mode delivers events over the WebSocket connection, not a Request URL — if a Request URL is also configured (e.g. left over from an old deployment), Slack will dispatch every event to both places, producing duplicate/conflicting responses.
-6. Ensure the required bot scopes are granted for: `chat:write`, `chat:write.public` (if posting outside channels the bot is in), `files:write` (file uploads), `reactions:write`, `assistant:write` (Agents & Assistants features — rotating status and step-trace streaming).
+3. **Subscribe to bot events**: `app_mention`, `message.im`.
+4. **Event Subscriptions → Request URL must be empty/unset.** Socket Mode delivers events over the WebSocket connection, not a Request URL — if a Request URL is also configured (e.g. left over from an old deployment), Slack will dispatch every event to both places, producing duplicate/conflicting responses.
+5. Ensure the required bot scopes are granted for: `chat:write`, `chat:write.public` (if posting outside channels the bot is in), `files:write` (file uploads), `reactions:write`, `assistant:write` (Agents & Assistants features — rotating status and step-trace streaming).
 
 ## Environment Variables
 
@@ -25,7 +24,6 @@ At [api.slack.com/apps](https://api.slack.com/apps), for this app:
 |---|---|
 | `SLACK_APP_TOKEN` | App-level token for the Socket Mode connection |
 | `SLACK_BOT_TOKEN` | Bot OAuth token for all Slack Web API calls |
-| `SLACK_SIGNING_SECRET` | Required by Bolt's `App` constructor |
 | `ANTHROPIC_API_KEY` | Claude API access |
 | `HUBSPOT_PRIVATE_APP_TOKEN` | HubSpot API access |
 
@@ -33,6 +31,7 @@ At [api.slack.com/apps](https://api.slack.com/apps), for this app:
 
 | Variable | Purpose |
 |---|---|
+| `SLACK_SIGNING_SECRET` | Basic Information → App Credentials. Not required in Socket Mode (Bolt only enforces it for the default HTTP receiver's signature verification), but harmless to set if you have it |
 | `PORT` | HTTP port for `/health` and `/clear-history` (defaults to 3000; Railway sets this automatically) |
 | `CLAUDE_MODEL` | Override the Claude model id (defaults to `claude-sonnet-4-6`) |
 | `LOG_CHANNEL_ID` | Slack channel ID for Q&A audit logging and failure escalation |
