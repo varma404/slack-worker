@@ -469,21 +469,26 @@ async function processEvent(event, slackToken, teamId) {
 
     const blocks = buildAnswerBlocks(answer, { skipFeedback: isClarification, usage: isClarification ? null : answerUsage });
 
-    // E4 mode finalizes the streaming message (step trace + final blocks in
-    // one message) via chat.stopStream instead of posting a new message.
-    const primaryPost = streamTs
-      ? slackRequest('/chat.stopStream', {
-          channel: event.channel,
-          ts: streamTs,
-          chunks: [{ type: 'plan_update', title: `Completed (${toolStepCount} step${toolStepCount === 1 ? '' : 's'})` }],
-          blocks
-        }, slackToken)
-      : slackRequest('/chat.postMessage', {
-          channel: event.channel,
-          thread_ts: event.thread_ts || event.ts,
-          text: answer.slice(0, 200),
-          blocks
-        }, slackToken);
+    // The E4 stream (if active) only ever carries the step-trace UI — it's
+    // finalized here with just a completion title, never the answer itself.
+    // The real answer always posts as its own ordinary message below, which
+    // is also what gives it a real preview/notification text (chat.stopStream
+    // has no such field, so folding the answer into it left Slack's preview
+    // frozen on the stream's initial "Thinking..." placeholder).
+    if (streamTs) {
+      await slackRequest('/chat.stopStream', {
+        channel: event.channel,
+        ts: streamTs,
+        chunks: [{ type: 'plan_update', title: `Completed (${toolStepCount} step${toolStepCount === 1 ? '' : 's'})` }]
+      }, slackToken).catch(err => log('WARN', 'stream_stop_failed', { correlation_id: threadKey, error: err.message }));
+    }
+
+    const primaryPost = slackRequest('/chat.postMessage', {
+      channel: event.channel,
+      thread_ts: event.thread_ts || event.ts,
+      text: answer.slice(0, 200),
+      blocks
+    }, slackToken);
 
     await primaryPost.catch(err => {
       log('ERROR', 'answer_post_failed', { correlation_id: threadKey, error: err.message });
