@@ -106,6 +106,7 @@ TOOL SELECTION RULES:
 - If a search returns 0 results and the user expected data, re-check your filters: verify the property name with get_object_properties, confirm you used GTE+LTE (not BETWEEN), and make sure you searched the correct object type (Company for MQLs, not Contact).
 - When a search returns truncated: true and after is not null, you CAN call the same tool with the after cursor to get the next page — but only if the user's question requires all records. For counts, use count_objects instead.
 - If a tool response includes "truncated": true, tell the user the exact total count and that you're showing a subset. Suggest narrowing filters if the total is large.
+- Use send_data_as_file ONLY when the user explicitly asks for a CSV, TSV, spreadsheet, export, or downloadable file. Do NOT use it automatically for ordinary lists — those should stay inline as text or a markdown table.
 
 === QUERY PLAYBOOKS ===
 ${QUERY_PLAYBOOKS}
@@ -152,6 +153,28 @@ const anthropicTools = MCP_TOOLS.map(t => ({
   input_schema: t.inputSchema,
 }));
 
+// A separate tool (not a HubSpot data tool — handled specially in askClaude's
+// tool loop, see SEND_FILE_TOOL_NAME below) matching DE Agent's on-demand
+// send_slack_file capability: Claude decides when a CSV/TSV export is
+// actually useful, rather than every multi-record list automatically
+// getting one. This is distinct from the automatic long-answer .md
+// fallback in processEvent, which exists purely to fit within Slack's
+// markdown-block character limit, not as an export feature.
+const SEND_FILE_TOOL_NAME = 'send_data_as_file';
+const SEND_FILE_TOOL = {
+  name: SEND_FILE_TOOL_NAME,
+  description: 'Upload data as a downloadable file attachment in this Slack thread. Use ONLY when the user explicitly asks for a CSV, TSV, spreadsheet, export, or downloadable file — never automatically for normal record lists, which should stay inline as text or a markdown table.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      filename: { type: 'string', description: 'File name including extension, e.g. "icp_contacts.csv" or "deals_export.tsv".' },
+      content: { type: 'string', description: 'The full file content: one header row, then one row per record, with fields separated by commas (.csv) or real tab characters (.tsv) matching the filename extension.' },
+    },
+    required: ['filename', 'content'],
+  },
+};
+anthropicTools.push(SEND_FILE_TOOL);
+
 // ─── Express App ──────────────────────────────────────────────────────────────
 
 const app = express();
@@ -172,7 +195,7 @@ function addUsage(totals, usage) {
   totals.cache_creation_input_tokens += usage.cache_creation_input_tokens || 0;
 }
 
-async function askClaude(question, threadKey, statusUpdater = async () => {}, streamUpdater = async () => {}) {
+async function askClaude(question, threadKey, statusUpdater = async () => {}, streamUpdater = async () => {}, sendFile = async () => ({ error: 'file sending not available on this path' })) {
   await statusUpdater('Analyzing your request...');
 
   const history = getThreadMessages(threadKey);
@@ -216,7 +239,9 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}, st
       log('INFO', 'tool_use', { correlation_id: threadKey, tool: block.name });
       await statusUpdater(getToolStatus(block.name));
       await streamUpdater('start', block.name);
-      const result = await executeTool(block.name, block.input, { correlation_id: threadKey });
+      const result = block.name === SEND_FILE_TOOL_NAME
+        ? await sendFile(block.input.filename, block.input.content)
+        : await executeTool(block.name, block.input, { correlation_id: threadKey });
       await streamUpdater('complete', block.name, !result.error);
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
     }
@@ -408,10 +433,24 @@ async function processEvent(event, slackToken, teamId) {
       }, slackToken).catch(err => log('WARN', 'stream_append_failed', { correlation_id: threadKey, error: err.message }));
     }
 
+    // Backs the SEND_FILE_TOOL Claude can call explicitly (see index.js top)
+    // when a user asks for a CSV/TSV/export — distinct from the automatic
+    // long-answer .md fallback below, which exists only to stay within
+    // Slack's markdown-block character limit.
+    async function sendFile(filename, content) {
+      try {
+        await uploadFile(filename, content, { channelId: event.channel, threadTs }, slackToken);
+        return { ok: true };
+      } catch (err) {
+        log('WARN', 'send_file_tool_failed', { correlation_id: threadKey, error: err.message });
+        return { error: err.message };
+      }
+    }
+
     let answer;
     let answerUsage = null;
     try {
-      const result = await askClaude(question, threadKey, statusUpdater, streamUpdater);
+      const result = await askClaude(question, threadKey, statusUpdater, streamUpdater, sendFile);
       answer = trimToAnswer(result.text);
       answerUsage = result.usage;
     } catch (err) {

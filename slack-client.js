@@ -78,6 +78,7 @@ const TOOL_STATUS = {
   get_deal: 'Fetching the record...',
   get_company: 'Fetching the record...',
   count_objects: 'Counting records...',
+  send_data_as_file: 'Preparing your file...',
 };
 
 const FALLBACK_STATUSES = [
