@@ -249,11 +249,11 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}, st
     for (const block of toolBlocks) {
       log('INFO', 'tool_use', { correlation_id: threadKey, tool: block.name });
       await statusUpdater(getToolStatus(block.name));
-      await streamUpdater('start', block.name);
+      await streamUpdater('start', block.name, block.input);
       const result = block.name === SEND_FILE_TOOL_NAME
         ? await sendFile(block.input.filename, block.input.content)
         : await executeTool(block.name, block.input, { correlation_id: threadKey });
-      await streamUpdater('complete', block.name, !result.error);
+      await streamUpdater('complete', block.name, block.input, !result.error);
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
     }
     messages.push({ role: 'user', content: toolResults });
@@ -350,16 +350,24 @@ async function processEvent(event, slackToken, teamId) {
       }
     }
 
-    // Tries the step-trace streaming UI (chat.startStream/appendStream/
-    // stopStream — "E4") first; if that call fails for any reason, it falls
-    // back to the simpler rotating assistant status ("E3",
-    // assistant.threads.setStatus) rather than leaving the user with a
-    // broken request — this surface is newer and less proven than the rest
-    // of the Slack Web API used elsewhere in this file.
+    // Always shows a rotating assistant status ("E3", assistant.threads.
+    // setStatus) immediately, independent of the step-list stream below —
+    // separately, also attempts a collapsible step-list stream
+    // (chat.startStream/appendStream/stopStream — "E4") that runs alongside
+    // it when available. These are complementary, not alternatives: E3
+    // gives instant animated feedback, E4 adds a per-tool-call breakdown
+    // once the stream is up.
     const threadTs = event.thread_ts || event.ts;
 
     let streamTs = null;
     let toolStepCount = 0;
+
+    await slackRequest('/assistant.threads.setStatus', {
+      channel_id: event.channel,
+      thread_ts: threadTs,
+      status: 'Analyzing your request...',
+      loading_messages: ['Analyzing your request...', 'Reading the CRM schema...', 'Querying HubSpot...', 'Crunching the numbers...']
+    }, slackToken).catch(err => log('ERROR', 'status_post_failed', { correlation_id: threadKey, error: err.message }));
 
     try {
       if (!teamId) throw new Error('missing_recipient_team_id (no Bolt context.teamId available)');
@@ -368,26 +376,23 @@ async function processEvent(event, slackToken, teamId) {
         thread_ts: threadTs,
         recipient_team_id: teamId,
         recipient_user_id: event.user,
-        task_display_mode: 'timeline'
+        task_display_mode: 'plan'
       }, slackToken);
       streamTs = streamStart.ts;
       log('INFO', 'stream_mode', { correlation_id: threadKey, mode: 'e4' });
+      // Establishes the collapsible step-list container before any
+      // task_update chunks arrive — without this, Slack has nothing to
+      // attach per-tool cards to.
+      await slackRequest('/chat.appendStream', {
+        channel: event.channel,
+        ts: streamTs,
+        chunks: [{ type: 'plan_update', title: 'Working on it...' }]
+      }, slackToken).catch(err => log('WARN', 'stream_append_failed', { correlation_id: threadKey, error: err.message }));
     } catch (err) {
       log('WARN', 'stream_start_failed', { correlation_id: threadKey, error: err.message });
     }
 
-    if (!streamTs) {
-      log('INFO', 'stream_mode', { correlation_id: threadKey, mode: 'e3-fallback' });
-      await slackRequest('/assistant.threads.setStatus', {
-        channel_id: event.channel,
-        thread_ts: threadTs,
-        status: 'Analyzing your request...',
-        loading_messages: ['Analyzing your request...', 'Reading the CRM schema...', 'Querying HubSpot...', 'Crunching the numbers...']
-      }, slackToken).catch(err => log('ERROR', 'status_post_failed', { correlation_id: threadKey, error: err.message }));
-    }
-
     async function statusUpdater(text) {
-      if (streamTs) return; // E4 mode: streamUpdater drives the visual instead
       await slackRequest('/assistant.threads.setStatus', {
         channel_id: event.channel,
         thread_ts: threadTs,
@@ -395,15 +400,18 @@ async function processEvent(event, slackToken, teamId) {
       }, slackToken).catch(err => log('WARN', 'status_update_failed', { correlation_id: threadKey, error: err.message }));
     }
 
-    // Only active in E4 mode (streamTs set). Emits a task_update chunk pair
-    // per tool call — 'in_progress' when it starts, 'complete'/'error' when
-    // it finishes — producing the per-step accordion. Tool calls in this
-    // loop are sequential (never concurrent), so toolStepCount is a safe
-    // stable id across each pair.
-    async function streamUpdater(phase, toolName, ok) {
+    // Only active when the E4 stream is up (streamTs set). Emits a
+    // task_update chunk pair per tool call — 'in_progress' when it starts,
+    // 'complete'/'error' when it finishes — producing the per-step
+    // accordion, with `details` populated from the tool's input so each
+    // card has something to expand into. Tool calls in this loop are
+    // sequential (never concurrent), so toolStepCount is a safe stable id
+    // across each pair.
+    async function streamUpdater(phase, toolName, input, ok) {
       if (!streamTs) return;
       if (phase === 'start') toolStepCount++;
       const title = getToolStatus(toolName).replace(/\.\.\.$/, '');
+      const details = input ? JSON.stringify(input).slice(0, 250) : undefined;
       await slackRequest('/chat.appendStream', {
         channel: event.channel,
         ts: streamTs,
@@ -411,7 +419,8 @@ async function processEvent(event, slackToken, teamId) {
           type: 'task_update',
           id: String(toolStepCount),
           title,
-          status: phase === 'start' ? 'in_progress' : (ok ? 'complete' : 'error')
+          status: phase === 'start' ? 'in_progress' : (ok ? 'complete' : 'error'),
+          ...(details ? { details } : {})
         }]
       }, slackToken).catch(err => log('WARN', 'stream_append_failed', { correlation_id: threadKey, error: err.message }));
     }
