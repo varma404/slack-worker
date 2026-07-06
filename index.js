@@ -23,6 +23,17 @@ const {
   getActiveThreadCount,
 } = require('./thread-state');
 
+// ─── Startup Validation ─────────────────────────────────────────────────────
+// Fail fast and loud on misconfiguration rather than silently degrading
+// behavior. Socket Mode is the only supported architecture — every one of
+// these is required for the process to do anything useful.
+const REQUIRED_ENV_VARS = ['SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'ANTHROPIC_API_KEY', 'HUBSPOT_PRIVATE_APP_TOKEN'];
+const missingEnvVars = REQUIRED_ENV_VARS.filter(name => !process.env[name]);
+if (missingEnvVars.length > 0) {
+  log('ERROR', 'missing_required_env_vars', { missing: missingEnvVars });
+  process.exit(1);
+}
+
 // ─── Claude Client & System Prompt ──────────────────────────────────────────
 
 const anthropic = new Anthropic();
@@ -339,41 +350,33 @@ async function processEvent(event, slackToken, teamId) {
       }
     }
 
-    // Socket Mode (Agents & AI Apps enabled) tries the step-trace streaming
-    // UI (chat.startStream/appendStream/stopStream — "E4") first; if that
-    // call fails for any reason, it falls back to the simpler rotating
-    // assistant status ("E3", assistant.threads.setStatus) rather than
-    // leaving the user with a broken request — this surface is newer and
-    // less proven than the rest of the Slack Web API used elsewhere in this
-    // file. The legacy webhook fallback (SLACK_APP_TOKEN unset) keeps the
-    // original chat.postMessage/chat.update/chat.delete flow untouched,
-    // since neither streaming nor assistant status are reachable without
-    // Socket Mode's AI-app capability.
-    const isAgentApp = !!process.env.SLACK_APP_TOKEN;
+    // Tries the step-trace streaming UI (chat.startStream/appendStream/
+    // stopStream — "E4") first; if that call fails for any reason, it falls
+    // back to the simpler rotating assistant status ("E3",
+    // assistant.threads.setStatus) rather than leaving the user with a
+    // broken request — this surface is newer and less proven than the rest
+    // of the Slack Web API used elsewhere in this file.
     const threadTs = event.thread_ts || event.ts;
 
-    let statusTs = null;
     let streamTs = null;
     let toolStepCount = 0;
 
-    if (isAgentApp) {
-      try {
-        if (!teamId) throw new Error('missing_recipient_team_id (no Bolt context.teamId available)');
-        const streamStart = await slackRequest('/chat.startStream', {
-          channel: event.channel,
-          thread_ts: threadTs,
-          recipient_team_id: teamId,
-          recipient_user_id: event.user,
-          task_display_mode: 'timeline'
-        }, slackToken);
-        streamTs = streamStart.ts;
-        log('INFO', 'stream_mode', { correlation_id: threadKey, mode: 'e4' });
-      } catch (err) {
-        log('WARN', 'stream_start_failed', { correlation_id: threadKey, error: err.message });
-      }
+    try {
+      if (!teamId) throw new Error('missing_recipient_team_id (no Bolt context.teamId available)');
+      const streamStart = await slackRequest('/chat.startStream', {
+        channel: event.channel,
+        thread_ts: threadTs,
+        recipient_team_id: teamId,
+        recipient_user_id: event.user,
+        task_display_mode: 'timeline'
+      }, slackToken);
+      streamTs = streamStart.ts;
+      log('INFO', 'stream_mode', { correlation_id: threadKey, mode: 'e4' });
+    } catch (err) {
+      log('WARN', 'stream_start_failed', { correlation_id: threadKey, error: err.message });
     }
 
-    if (isAgentApp && !streamTs) {
+    if (!streamTs) {
       log('INFO', 'stream_mode', { correlation_id: threadKey, mode: 'e3-fallback' });
       await slackRequest('/assistant.threads.setStatus', {
         channel_id: event.channel,
@@ -381,34 +384,14 @@ async function processEvent(event, slackToken, teamId) {
         status: 'Analyzing your request...',
         loading_messages: ['Analyzing your request...', 'Reading the CRM schema...', 'Querying HubSpot...', 'Crunching the numbers...']
       }, slackToken).catch(err => log('ERROR', 'status_post_failed', { correlation_id: threadKey, error: err.message }));
-    } else if (!isAgentApp) {
-      try {
-        const statusMsg = await slackRequest('/chat.postMessage', {
-          channel: event.channel,
-          thread_ts: threadTs,
-          text: 'Analyzing your request...'
-        }, slackToken);
-        statusTs = statusMsg.ts;
-      } catch (err) {
-        log('ERROR', 'status_post_failed', { correlation_id: threadKey, error: err.message });
-      }
     }
 
     async function statusUpdater(text) {
       if (streamTs) return; // E4 mode: streamUpdater drives the visual instead
-      if (isAgentApp) {
-        await slackRequest('/assistant.threads.setStatus', {
-          channel_id: event.channel,
-          thread_ts: threadTs,
-          status: text
-        }, slackToken).catch(err => log('WARN', 'status_update_failed', { correlation_id: threadKey, error: err.message }));
-        return;
-      }
-      if (!statusTs) return;
-      await slackRequest('/chat.update', {
-        channel: event.channel,
-        ts: statusTs,
-        text
+      await slackRequest('/assistant.threads.setStatus', {
+        channel_id: event.channel,
+        thread_ts: threadTs,
+        status: text
       }, slackToken).catch(err => log('WARN', 'status_update_failed', { correlation_id: threadKey, error: err.message }));
     }
 
@@ -462,13 +445,6 @@ async function processEvent(event, slackToken, teamId) {
         answer = `**API Usage Limit Reached**\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
       } else {
         answer = `**Error:** ${raw}`;
-      }
-    } finally {
-      if (statusTs) {
-        await slackRequest('/chat.delete', {
-          channel: event.channel,
-          ts: statusTs
-        }, slackToken).catch(err => log('WARN', 'status_delete_failed', { correlation_id: threadKey, error: err.message }));
       }
     }
 
@@ -566,24 +542,6 @@ app.get('/health', (req, res) => res.json({
   }
 }));
 
-app.post('/process', async (req, res) => {
-  if (process.env.SLACK_APP_TOKEN) {
-    return res.status(410).json({ error: 'Socket Mode active — webhook disabled' });
-  }
-
-  const workerSecret = process.env.WORKER_SECRET;
-  if (workerSecret && req.headers['x-worker-secret'] !== workerSecret) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const { event, token } = req.body;
-  if (!event || !token) return res.status(400).json({ error: 'Missing event or token' });
-
-  res.status(200).json({ queued: true });
-
-  processEvent(event, token).catch(err => log('ERROR', 'webhook_process_error', { error: err.message }));
-});
-
 app.post('/clear-history', (req, res) => {
   const workerSecret = process.env.WORKER_SECRET;
   if (workerSecret && req.headers['x-worker-secret'] !== workerSecret) {
@@ -598,51 +556,47 @@ const httpServer = app.listen(PORT, () => log('INFO', 'worker_listening', { port
 
 // ─── Slack Socket Mode (bolt) ─────────────────────────────────────────────────
 
-if (process.env.SLACK_APP_TOKEN) {
-  const slackApp = new App({
-    token: process.env.SLACK_BOT_TOKEN,
-    signingSecret: process.env.SLACK_SIGNING_SECRET,
-    socketMode: true,
-    appToken: process.env.SLACK_APP_TOKEN,
-  });
+const slackApp = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  socketMode: true,
+  appToken: process.env.SLACK_APP_TOKEN,
+});
 
-  slackApp.event('app_mention', async ({ event, context }) => {
-    if (event.bot_id || event.subtype) return;
+slackApp.event('app_mention', async ({ event, context }) => {
+  if (event.bot_id || event.subtype) return;
+  processEvent(event, process.env.SLACK_BOT_TOKEN, context.teamId)
+    .catch(err => log('ERROR', 'bolt_app_mention_error', { error: err.message }));
+});
+
+slackApp.event('message', async ({ event, context }) => {
+  if (event.channel_type === 'im' && !event.bot_id && !event.subtype) {
     processEvent(event, process.env.SLACK_BOT_TOKEN, context.teamId)
-      .catch(err => log('ERROR', 'bolt_app_mention_error', { error: err.message }));
-  });
+      .catch(err => log('ERROR', 'bolt_message_error', { error: err.message }));
+  }
+});
 
-  slackApp.event('message', async ({ event, context }) => {
-    if (event.channel_type === 'im' && !event.bot_id && !event.subtype) {
-      processEvent(event, process.env.SLACK_BOT_TOKEN, context.teamId)
-        .catch(err => log('ERROR', 'bolt_message_error', { error: err.message }));
-    }
+slackApp.action('feedback', async ({ ack, body, action }) => {
+  await ack();
+  const value = action.value; // 'good-feedback' | 'bad-feedback'
+  log('INFO', 'feedback_received', {
+    value,
+    user: body.user && body.user.id,
+    channel: body.channel && body.channel.id,
+    message_ts: body.message && body.message.ts,
   });
+  const logChannel = process.env.LOG_CHANNEL_ID;
+  if (logChannel) {
+    slackRequest('/chat.postMessage', {
+      channel: logChannel,
+      text: `${value === 'good-feedback' ? '👍' : '👎'} Feedback from <@${body.user.id}> on <#${body.channel.id}|${body.message.ts}>`
+    }, process.env.SLACK_BOT_TOKEN).catch(err => log('WARN', 'feedback_log_post_failed', { error: err.message }));
+  }
+});
 
-  slackApp.action('feedback', async ({ ack, body, action }) => {
-    await ack();
-    const value = action.value; // 'good-feedback' | 'bad-feedback'
-    log('INFO', 'feedback_received', {
-      value,
-      user: body.user && body.user.id,
-      channel: body.channel && body.channel.id,
-      message_ts: body.message && body.message.ts,
-    });
-    const logChannel = process.env.LOG_CHANNEL_ID;
-    if (logChannel) {
-      slackRequest('/chat.postMessage', {
-        channel: logChannel,
-        text: `${value === 'good-feedback' ? '👍' : '👎'} Feedback from <@${body.user.id}> on <#${body.channel.id}|${body.message.ts}>`
-      }, process.env.SLACK_BOT_TOKEN).catch(err => log('WARN', 'feedback_log_post_failed', { error: err.message }));
-    }
-  });
-
-  slackApp.start()
-    .then(() => log('INFO', 'socket_mode_active', {}))
-    .catch(err => log('ERROR', 'socket_mode_start_failed', { error: err.message }));
-} else {
-  log('INFO', 'socket_mode_disabled', { reason: 'no SLACK_APP_TOKEN, using Vercel webhook' });
-}
+slackApp.start()
+  .then(() => log('INFO', 'socket_mode_active', {}))
+  .catch(err => log('ERROR', 'socket_mode_start_failed', { error: err.message }));
 
 // ─── Graceful Shutdown ──────────────────────────────────────────────────────
 
