@@ -84,13 +84,13 @@ Most questions have a clear best interpretation — resolve those yourself using
 3. A metric or term has no definition in the Saras business context AND no established default in this prompt, AND more than one reasonable interpretation would change the result (e.g. "our best customers" — by revenue? by deal count? by tenure? there is no default). Do NOT ask for terms that ARE defined (MQL, ICP, SQL, funnel milestones) — use the definition.
 4. A count/list request is scoped to an object or property that could plausibly mean two different HubSpot objects with different answers (e.g. "how many deals do we have with Acme" could mean deals associated with the Acme company record, or deals where the deal name contains "Acme" — ask if a quick get_object_properties/search_objects check shows both readings would return different counts).
 
-When in doubt, prefer answering with your best interpretation and stating it explicitly in *Filters applied:* over asking — a stated assumption the user can correct is better than an interruption, UNLESS the ambiguity is a fork in what OBJECT or WHICH RECORD the entire query is about (name collision, metric definition), in which case ask.
+When in doubt, prefer answering with your best interpretation and stating it explicitly in **Filters applied:** over asking — a stated assumption the user can correct is better than an interruption, UNLESS the ambiguity is a fork in what OBJECT or WHICH RECORD the entire query is about (name collision, metric definition), in which case ask.
 
 Ask AT MOST one question, offering the specific options you found (e.g. list the 2-3 matching companies with their domain/city to disambiguate). Never ask a vague "can you clarify?" — the question must name the specific fork and the concrete options.
 
 To ask a clarifying question: do not call any more tools. End your turn with text starting EXACTLY with:
 
-🤔 *Need a bit more detail:* <your specific question, naming the exact fork and options>
+🤔 **Need a bit more detail:** <your specific question, naming the exact fork and options>
 
 Do NOT use this prefix for anything except a genuine blocking ambiguity. Do NOT use it to ask permission to run a query, confirm scope, or hedge — only when you cannot proceed without the user's choice.
 
@@ -106,6 +106,7 @@ TOOL SELECTION RULES:
 - If a search returns 0 results and the user expected data, re-check your filters: verify the property name with get_object_properties, confirm you used GTE+LTE (not BETWEEN), and make sure you searched the correct object type (Company for MQLs, not Contact).
 - When a search returns truncated: true and after is not null, you CAN call the same tool with the after cursor to get the next page — but only if the user's question requires all records. For counts, use count_objects instead.
 - If a tool response includes "truncated": true, tell the user the exact total count and that you're showing a subset. Suggest narrowing filters if the total is large.
+- Use send_data_as_file ONLY when the user explicitly asks for a CSV, TSV, spreadsheet, export, or downloadable file. Do NOT use it automatically for ordinary lists — those should stay inline as text or a markdown table.
 
 === QUERY PLAYBOOKS ===
 ${QUERY_PLAYBOOKS}
@@ -114,36 +115,29 @@ RESPONSE RULES:
 - Call all tools silently — zero text output while fetching data
 - Only produce text ONCE as your final answer, using this exact structure:
 
-*Answer:* <the direct result — count, list, or value>
+**Answer:** <the direct result — count, list, or value>
 
-*Filters applied:*
+**Filters applied:**
 • <filter 1>
 • <filter 2>
 
-*Notes:* <only if something important needs flagging>
+**Notes:** <only if something important needs flagging>
 
-If there is nothing to flag, omit the *Notes:* line entirely — do not write "*Notes:* None" or "*Notes:* N/A".
+If there is nothing to flag, omit the **Notes:** line entirely — do not write "**Notes:** None" or "**Notes:** N/A".
 
 - Do NOT narrate your reasoning, show intermediate checks, or list records you rejected
 - Do NOT show ✅ / ❌ per record — only show records that matched
 - If listing matched records, show: name, stage, amount, and any other directly relevant fields
 - For result sets with more than 20 records, show a grouped summary (e.g. by stage, country, or source) with counts. Offer to list individual records if the user wants.
-- Do NOT prefix *Answer:* with any lead-in text ("Here's what I found:", "Sure, here's the breakdown:", etc.) and do NOT add a closing line after your last section ("Let me know if you need anything else!", "Happy to dig deeper if needed."). The response ends at the last populated section.
-- When you list 3 or more individual records with multiple fields each (not a grouped summary), ALSO emit a tab-separated data block immediately after your *Filters applied:*/*Notes:* sections, using this exact delimiter format:
-
-===TSV_TABLE===
-Column1<TAB>Column2<TAB>Column3
-value1<TAB>value2<TAB>value3
-===END_TSV_TABLE===
-
-Use a real tab character between columns, one header row, one row per record, and the same fields you already chose to show in the text above. This becomes a downloadable table attachment — do not describe it or reference it in your answer text, just emit the block. Skip this block entirely for grouped summaries, single-record answers, or count-only answers.
+- Do NOT prefix **Answer:** with any lead-in text ("Here's what I found:", "Sure, here's the breakdown:", etc.) and do NOT add a closing line after your last section ("Let me know if you need anything else!", "Happy to dig deeper if needed."). The response ends at the last populated section.
+- You may use a standard Markdown table (header row, a separator row of dashes, then data rows, all using | to separate columns) when tabular data is the clearest presentation — it renders as a real table in Slack. Use it for genuinely tabular comparisons; for simple lists, a numbered/bulleted list is still often clearer.
 
 SLACK FORMATTING RULES — follow strictly:
-- Bold: *text* (single asterisk, NOT double **)
+- Bold: **text** (double asterisk — standard Markdown, NOT Slack's classic single-asterisk mrkdwn)
 - Bullet lists: start lines with •
 - Numbered lists: 1. 2. 3.
-- NO markdown tables (no | pipes) — use numbered lists instead
-- NO ## or # headers — use *Bold Title* on its own line
+- Markdown tables ARE supported — use pipe (|) syntax when a table is the clearest format
+- NO ## or # headers — use **Bold Title** on its own line
 
 Always use tools to fetch actual data — never say you "don't have access".
 
@@ -158,6 +152,28 @@ const anthropicTools = MCP_TOOLS.map(t => ({
   description: t.description,
   input_schema: t.inputSchema,
 }));
+
+// A separate tool (not a HubSpot data tool — handled specially in askClaude's
+// tool loop, see SEND_FILE_TOOL_NAME below) matching DE Agent's on-demand
+// send_slack_file capability: Claude decides when a CSV/TSV export is
+// actually useful, rather than every multi-record list automatically
+// getting one. This is distinct from the automatic long-answer .md
+// fallback in processEvent, which exists purely to fit within Slack's
+// markdown-block character limit, not as an export feature.
+const SEND_FILE_TOOL_NAME = 'send_data_as_file';
+const SEND_FILE_TOOL = {
+  name: SEND_FILE_TOOL_NAME,
+  description: 'Upload data as a downloadable file attachment in this Slack thread. Use ONLY when the user explicitly asks for a CSV, TSV, spreadsheet, export, or downloadable file — never automatically for normal record lists, which should stay inline as text or a markdown table.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      filename: { type: 'string', description: 'File name including extension, e.g. "icp_contacts.csv" or "deals_export.tsv".' },
+      content: { type: 'string', description: 'The full file content: one header row, then one row per record, with fields separated by commas (.csv) or real tab characters (.tsv) matching the filename extension.' },
+    },
+    required: ['filename', 'content'],
+  },
+};
+anthropicTools.push(SEND_FILE_TOOL);
 
 // ─── Express App ──────────────────────────────────────────────────────────────
 
@@ -179,7 +195,7 @@ function addUsage(totals, usage) {
   totals.cache_creation_input_tokens += usage.cache_creation_input_tokens || 0;
 }
 
-async function askClaude(question, threadKey, statusUpdater = async () => {}, streamUpdater = async () => {}) {
+async function askClaude(question, threadKey, statusUpdater = async () => {}, streamUpdater = async () => {}, sendFile = async () => ({ error: 'file sending not available on this path' })) {
   await statusUpdater('Analyzing your request...');
 
   const history = getThreadMessages(threadKey);
@@ -223,7 +239,9 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}, st
       log('INFO', 'tool_use', { correlation_id: threadKey, tool: block.name });
       await statusUpdater(getToolStatus(block.name));
       await streamUpdater('start', block.name);
-      const result = await executeTool(block.name, block.input, { correlation_id: threadKey });
+      const result = block.name === SEND_FILE_TOOL_NAME
+        ? await sendFile(block.input.filename, block.input.content)
+        : await executeTool(block.name, block.input, { correlation_id: threadKey });
       await streamUpdater('complete', block.name, !result.error);
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
     }
@@ -238,7 +256,7 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}, st
     const summaryResp = await anthropic.messages.create({
       model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 2000,
-      system: buildSystemPrompt('You have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the *Answer:* / *Filters applied:* / *Notes:* structure, but replace *Answer:* with *Partial answer (ran out of steps):* and use *Notes:* to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).'),
+      system: buildSystemPrompt('You have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the **Answer:** / **Filters applied:** / **Notes:** structure, but replace **Answer:** with **Partial answer (ran out of steps):** and use **Notes:** to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).'),
       tools: anthropicTools,
       tool_choice: { type: 'none' },
       messages,
@@ -257,14 +275,15 @@ function trimToAnswer(text) {
   return match ? text.slice(match.index) : text;
 }
 
-// Pulls the optional ===TSV_TABLE===...===END_TSV_TABLE=== block (see the
-// RESPONSE RULES prompt section) out of the answer text so it can be
-// uploaded as a file attachment instead of rendered inline.
-function extractTsvTable(answer) {
-  const match = answer.match(/===TSV_TABLE===\n([\s\S]*?)\n===END_TSV_TABLE===/);
-  if (!match) return { text: answer, tsv: null };
-  const text = (answer.slice(0, match.index) + answer.slice(match.index + match[0].length)).trim();
-  return { text, tsv: match[1] };
+// Slack's cumulative limit across all "markdown" blocks in one message is
+// 12,000 characters (matches DE Agent's own SLACK_BLOCK_CHAR_LIMIT). Past
+// that, don't try to chunk it into more blocks — upload the full answer as
+// a file instead and post a short truncated notice in its place.
+const MAX_INLINE_ANSWER_CHARS = 12000;
+
+function truncateForNotice(text, maxChars) {
+  const cut = text.lastIndexOf('\n', maxChars);
+  return (cut > maxChars * 0.5 ? text.slice(0, cut) : text.slice(0, maxChars)).trim();
 }
 
 // ─── Event Processor ──────────────────────────────────────────────────────────
@@ -273,7 +292,7 @@ let shuttingDown = false;
 const startTs = Date.now();
 let lastInvocationTs = null;
 
-async function processEvent(event, slackToken) {
+async function processEvent(event, slackToken, teamId) {
   if (shuttingDown) return;
 
   const isMention = event.type === 'app_mention';
@@ -339,9 +358,12 @@ async function processEvent(event, slackToken) {
 
     if (isAgentApp) {
       try {
+        if (!teamId) throw new Error('missing_recipient_team_id (no Bolt context.teamId available)');
         const streamStart = await slackRequest('/chat.startStream', {
           channel: event.channel,
           thread_ts: threadTs,
+          recipient_team_id: teamId,
+          recipient_user_id: event.user,
           task_display_mode: 'timeline'
         }, slackToken);
         streamTs = streamStart.ts;
@@ -411,10 +433,24 @@ async function processEvent(event, slackToken) {
       }, slackToken).catch(err => log('WARN', 'stream_append_failed', { correlation_id: threadKey, error: err.message }));
     }
 
+    // Backs the SEND_FILE_TOOL Claude can call explicitly (see index.js top)
+    // when a user asks for a CSV/TSV/export — distinct from the automatic
+    // long-answer .md fallback below, which exists only to stay within
+    // Slack's markdown-block character limit.
+    async function sendFile(filename, content) {
+      try {
+        await uploadFile(filename, content, { channelId: event.channel, threadTs }, slackToken);
+        return { ok: true };
+      } catch (err) {
+        log('WARN', 'send_file_tool_failed', { correlation_id: threadKey, error: err.message });
+        return { error: err.message };
+      }
+    }
+
     let answer;
     let answerUsage = null;
     try {
-      const result = await askClaude(question, threadKey, statusUpdater, streamUpdater);
+      const result = await askClaude(question, threadKey, statusUpdater, streamUpdater, sendFile);
       answer = trimToAnswer(result.text);
       answerUsage = result.usage;
     } catch (err) {
@@ -423,9 +459,9 @@ async function processEvent(event, slackToken) {
       const limitMatch = raw.match(/you have reached your specified workspace api usage limits[^]*/i);
       if (limitMatch) {
         const detail = raw.match(/You will regain access[^".]*/i);
-        answer = `*API Usage Limit Reached*\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
+        answer = `**API Usage Limit Reached**\n${detail ? detail[0] + '.' : 'Monthly API quota exhausted.'}\nPlease contact your Anthropic account admin to increase the limit.`;
       } else {
-        answer = `*Error:* ${raw}`;
+        answer = `**Error:** ${raw}`;
       }
     } finally {
       if (statusTs) {
@@ -436,13 +472,12 @@ async function processEvent(event, slackToken) {
       }
     }
 
-    const isClarification = answer.startsWith('🤔 *Need a bit more detail:*');
+    const isClarification = answer.startsWith('🤔 **Need a bit more detail:**');
 
-    let tsvTable = null;
-    if (!isClarification) {
-      const extracted = extractTsvTable(answer);
-      answer = extracted.text;
-      tsvTable = extracted.tsv;
+    let longAnswerFile = null;
+    if (!isClarification && answer.length > MAX_INLINE_ANSWER_CHARS) {
+      longAnswerFile = answer;
+      answer = `${truncateForNotice(answer, 1500)}\n\n_(Full answer attached as a file in this thread — this response was too long to fit in one Slack message.)_`;
     }
 
     if (!hasHistory && !isClarification) setCache(cacheKey, answer);
@@ -483,11 +518,11 @@ async function processEvent(event, slackToken) {
       });
     });
 
-    if (tsvTable) {
-      uploadFile('hubspot-export.tsv', tsvTable, {
+    if (longAnswerFile) {
+      uploadFile('hubspot-answer.md', longAnswerFile, {
         channelId: event.channel,
         threadTs: event.thread_ts || event.ts,
-      }, slackToken).catch(err => log('WARN', 'tsv_upload_failed', { correlation_id: threadKey, error: err.message }));
+      }, slackToken).catch(err => log('WARN', 'long_answer_upload_failed', { correlation_id: threadKey, error: err.message }));
     }
 
     slackRequest('/reactions.remove', { channel: event.channel, timestamp: event.ts, name: 'eyes' }, slackToken).catch(() => {});
@@ -571,15 +606,15 @@ if (process.env.SLACK_APP_TOKEN) {
     appToken: process.env.SLACK_APP_TOKEN,
   });
 
-  slackApp.event('app_mention', async ({ event }) => {
+  slackApp.event('app_mention', async ({ event, context }) => {
     if (event.bot_id || event.subtype) return;
-    processEvent(event, process.env.SLACK_BOT_TOKEN)
+    processEvent(event, process.env.SLACK_BOT_TOKEN, context.teamId)
       .catch(err => log('ERROR', 'bolt_app_mention_error', { error: err.message }));
   });
 
-  slackApp.event('message', async ({ event }) => {
+  slackApp.event('message', async ({ event, context }) => {
     if (event.channel_type === 'im' && !event.bot_id && !event.subtype) {
-      processEvent(event, process.env.SLACK_BOT_TOKEN)
+      processEvent(event, process.env.SLACK_BOT_TOKEN, context.teamId)
         .catch(err => log('ERROR', 'bolt_message_error', { error: err.message }));
     }
   });
