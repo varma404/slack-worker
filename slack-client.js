@@ -160,27 +160,30 @@ function buildFeedbackBlock() {
   };
 }
 
-// NOTE: reverted from Slack's native "markdown" block back to the classic
-// "section"/"mrkdwn" block — the markdown block returned "invalid_blocks"
-// in production even after switching the Slack app to an AI/Agent app with
-// assistant:write, confirmed via two separate live tests. Root cause still
-// unconfirmed; not worth blocking answer delivery on it. Real pipe-table
-// rendering is not available with mrkdwn — see SLACK FORMATTING RULES in
-// the system prompt, which was reverted to single-asterisk bold to match.
+// Uses Slack's native "markdown" block (standard CommonMark, incl. real
+// tables) — see SLACK FORMATTING RULES in the system prompt for the
+// matching bold syntax. Previously reverted after an "invalid_blocks"
+// incident, but that was actually caused by buildFeedbackBlock() using the
+// wrong container block type (fixed separately) — the markdown block
+// itself was never the problem. Restored to match DE Agent's approach.
+// Slack's cumulative limit across all markdown blocks in one message is
+// 12,000 characters; the caller (processEvent) diverts anything over that
+// to a file upload before this function ever sees it, so the per-block
+// chunking below only needs to keep individual blocks a reasonable size.
 function buildAnswerBlocks(answer, { skipFeedback = false, usage = null } = {}) {
   const blocks = [];
   let remaining = answer;
   while (remaining.length > 2900) {
     if (blocks.length >= 48) {
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '_Response truncated — ask me to narrow the results._' } });
+      blocks.push({ type: 'markdown', text: '_Response truncated — ask me to narrow the results._' });
       return blocks;
     }
     const split = remaining.lastIndexOf('\n', 2900);
     const cutAt = split > 1000 ? split : 2900;
-    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining.slice(0, cutAt) } });
+    blocks.push({ type: 'markdown', text: remaining.slice(0, cutAt) });
     remaining = remaining.slice(cutAt).trimStart();
   }
-  if (remaining) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining } });
+  if (remaining) blocks.push({ type: 'markdown', text: remaining });
   const usageFooter = buildUsageFooter(usage);
   if (usageFooter) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: usageFooter }] });
   if (!skipFeedback) blocks.push(buildFeedbackBlock());
