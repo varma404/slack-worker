@@ -395,7 +395,15 @@ async function processEvent(event, slackToken, teamId) {
       log('WARN', 'stream_start_failed', { correlation_id: threadKey, error: err.message });
     }
 
+    // Matches the reference implementation's behavior exactly: setStatus is
+    // only ever called before the stream exists (Slack auto-clears it once
+    // the app "sends a reply," which the stream's first posted message
+    // counts as). Calling it again after streamTs is set produced a second,
+    // competing visual element in the thread alongside the step-list card —
+    // once streaming, all progress updates flow through streamUpdater
+    // (task_update chunks) instead.
     async function statusUpdater(text) {
+      if (streamTs) return;
       await slackRequest('/assistant.threads.setStatus', {
         channel_id: event.channel,
         thread_ts: threadTs,
