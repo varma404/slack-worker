@@ -229,9 +229,11 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}, st
       return { text: 'This is taking too long — try narrowing your question.', usage };
     }
     const response = await anthropic.messages.create({
-      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
+      model: process.env.CLAUDE_MODEL || 'claude-sonnet-5',
       max_tokens: 16000,
-      thinking: { type: 'enabled', budget_tokens: 5000 },
+      // Sonnet 5 rejects the old fixed-budget form (`enabled` + `budget_tokens`)
+      // with a 400 — adaptive thinking is the only supported "on" mode now.
+      thinking: { type: 'adaptive' },
       system: buildSystemPrompt(),
       tools: anthropicTools,
       messages,
@@ -268,8 +270,12 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}, st
   const FALLBACK_TEXT = 'Reached maximum iterations — try a more specific question.';
   try {
     const summaryResp = await anthropic.messages.create({
-      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
+      model: process.env.CLAUDE_MODEL || 'claude-sonnet-5',
       max_tokens: 2000,
+      // On Sonnet 5, omitting `thinking` now defaults to adaptive (was
+      // thinking-off on 4.6) — disable it explicitly here so the tight
+      // 2000-token budget goes entirely to the summary text, not reasoning.
+      thinking: { type: 'disabled' },
       system: buildSystemPrompt('You have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the **Answer:** / **Filters applied:** / **Notes:** structure, but replace **Answer:** with **Partial answer (ran out of steps):** and use **Notes:** to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).'),
       tools: anthropicTools,
       tool_choice: { type: 'none' },

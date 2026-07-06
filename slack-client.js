@@ -99,9 +99,13 @@ function getToolStatus(toolName) {
 // Claude Agent SDK) doesn't return a cost figure, so this is computed here.
 // Update if Anthropic's published pricing changes.
 const MODEL_RATES_PER_MTOK = {
+  // Standard post-introductory rate. Sonnet 5 is priced at $2/$10 through
+  // 2026-08-31 as an introductory discount; using the durable $3/$15 rate
+  // here so this table doesn't silently go stale once the promo ends.
+  'claude-sonnet-5': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
   'claude-sonnet-4-6': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
 };
-const DEFAULT_RATES = MODEL_RATES_PER_MTOK['claude-sonnet-4-6'];
+const DEFAULT_RATES = MODEL_RATES_PER_MTOK['claude-sonnet-5'];
 
 function formatTokenCount(n) {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
@@ -120,7 +124,7 @@ function estimateCostUsd(usage, model) {
 
 function buildUsageFooter(usage) {
   if (!usage) return null;
-  const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
+  const model = process.env.CLAUDE_MODEL || 'claude-sonnet-5';
   const totalIn = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
   const cacheParts = [];
   if (usage.cache_read_input_tokens) cacheParts.push(`${formatTokenCount(usage.cache_read_input_tokens)} cache read`);

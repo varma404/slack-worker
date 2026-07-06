@@ -33,7 +33,7 @@ At [api.slack.com/apps](https://api.slack.com/apps), for this app:
 |---|---|
 | `SLACK_SIGNING_SECRET` | Basic Information → App Credentials. Not required in Socket Mode (Bolt only enforces it for the default HTTP receiver's signature verification), but harmless to set if you have it |
 | `PORT` | HTTP port for `/health` and `/clear-history` (defaults to 3000; Railway sets this automatically) |
-| `CLAUDE_MODEL` | Override the Claude model id (defaults to `claude-sonnet-4-6`) |
+| `CLAUDE_MODEL` | Override the Claude model id (defaults to `claude-sonnet-5`) |
 | `LOG_CHANNEL_ID` | Slack channel ID for Q&A audit logging and failure escalation |
 | `BUSINESS_CONTEXT` | Free-text addendum appended to the system prompt |
 | `WORKER_SECRET` | Shared secret for `x-worker-secret` header auth on `POST /clear-history` — a general admin-endpoint secret, not worker-to-worker auth |
