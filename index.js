@@ -372,6 +372,13 @@ async function processEvent(event, slackToken, teamId) {
       loading_messages: ['Analyzing your request...', 'Reading the CRM schema...', 'Querying HubSpot...', 'Crunching the numbers...']
     }, slackToken).catch(err => log('ERROR', 'status_post_failed', { correlation_id: threadKey, error: err.message }));
 
+    // Slack auto-clears the rotating status as soon as the stream posts its
+    // first message, so without a pause here the E3 status is visible for
+    // well under a second before the E4 card replaces it. A short floor
+    // gives it time to actually be seen.
+    const E3_MIN_VISIBLE_MS = 3000;
+    await new Promise(resolve => setTimeout(resolve, E3_MIN_VISIBLE_MS));
+
     try {
       if (!teamId) throw new Error('missing_recipient_team_id (no Bolt context.teamId available)');
       const streamStart = await slackRequest('/chat.startStream', {
