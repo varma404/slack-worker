@@ -74,11 +74,13 @@ const TOOL_STATUS = {
   get_deals_with_company_properties: 'Pulling deals and accounts...',
   get_companies_with_deal_properties: 'Pulling accounts and deals...',
   get_contacts_with_company_properties: 'Pulling contacts and accounts...',
+  get_companies_with_contact_properties: 'Pulling accounts and contacts...',
   get_associations: 'Connecting the dots...',
   get_contact: 'Fetching the record...',
   get_deal: 'Fetching the record...',
   get_company: 'Fetching the record...',
   count_objects: 'Counting records...',
+  list_owners: 'Looking up owners...',
   send_data_as_file: 'Preparing your file...',
 };
 

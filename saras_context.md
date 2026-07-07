@@ -67,6 +67,7 @@ When a user uses natural language terms, map them as follows. The **Do NOT** rul
 | "CXO" / "C-level" / "C-suite" / "executives" | `jobtitle` CONTAINS_TOKEN each of: `CEO`, `CFO`, `CTO`, `CMO`, `COO`, `Chief` | Contact | Search per title separately, combine and deduplicate by contact ID |
 | "spoken to" / "contacted" / "reached out to" | `notes_last_contacted` with date range filter | Contact, Company | Use GTE for start date |
 | "brand" / "brand name" / "company name" (in contact context) | Get associated Company `name` via `get_contacts_with_company_properties` | Contact→Company | Do NOT use the Contact `company` field — it's a free-text string, not a live association |
+| "owner" / "who owns this deal/company" / "[rep name]'s deals" | `hubspot_owner_id` (confirm via `get_object_properties`) | Contact, Company, Deal | Resolve rep name → ID via `list_owners` first, then filter |
 
 ---
 

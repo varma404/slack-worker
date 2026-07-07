@@ -12,8 +12,15 @@ const { log } = require('./logger');
 const HUBSPOT_MAX_RETRIES = 3;
 const HUBSPOT_RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 
-function hubspotBackoffDelay(attempt) {
-  return Math.min(1000 * 2 ** attempt, 8000) + Math.floor(Math.random() * 250);
+function hubspotBackoffDelay(attempt, retryAfterMs = 0) {
+  const base = Math.min(1000 * 2 ** attempt, 8000) + Math.floor(Math.random() * 250);
+  return Math.max(base, retryAfterMs);
+}
+
+function parseRetryAfterMs(headerValue) {
+  if (!headerValue) return 0;
+  const seconds = Number(headerValue);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 0;
 }
 
 function hubspotRequest(method, path, body = null, _attempt = 0) {
@@ -32,11 +39,11 @@ function hubspotRequest(method, path, body = null, _attempt = 0) {
     };
 
     let settled = false;
-    const retry = (reason) => {
+    const retry = (reason, retryAfterMs = 0) => {
       if (settled) return;
       settled = true;
       if (_attempt < HUBSPOT_MAX_RETRIES) {
-        const delay = hubspotBackoffDelay(_attempt);
+        const delay = hubspotBackoffDelay(_attempt, retryAfterMs);
         log('WARN', 'hubspot_retry', { path, attempt: _attempt + 1, delay, reason });
         setTimeout(() => hubspotRequest(method, path, body, _attempt + 1).then(resolve, reject), delay);
       } else {
@@ -57,7 +64,7 @@ function hubspotRequest(method, path, body = null, _attempt = 0) {
         try {
           const parsed = JSON.parse(raw);
           if (HUBSPOT_RETRYABLE_STATUS.has(res.statusCode)) {
-            retry(`HubSpot ${res.statusCode}: ${parsed.message}`);
+            retry(`HubSpot ${res.statusCode}: ${parsed.message}`, parseRetryAfterMs(res.headers['retry-after']));
             return;
           }
           if (res.statusCode >= 400) settle(reject, new Error(`HubSpot ${res.statusCode}: ${parsed.message}`));
@@ -91,9 +98,26 @@ function compactProps(props) {
   return out;
 }
 
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
 // ─── Tool Definitions ─────────────────────────────────────────────────────────
 
 const TOOLS = [
+  {
+    name: 'list_owners',
+    description: 'List HubSpot owners (the sales reps/users assignable as hubspot_owner_id on contacts, companies, and deals). There is no name-based owner filter on HubSpot\'s API — use this to fetch the owner list and match a name to its numeric ID yourself before filtering by ownership. Optionally filter to one owner by exact email.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        email: { type: 'string', description: 'Optional — return only the owner with this exact email address.' }
+      },
+      required: []
+    }
+  },
   {
     name: 'get_object_properties',
     description: 'List all available properties (including custom ones) for a HubSpot object type. Call this first when you need to filter or retrieve a property whose name you don\'t know (e.g. MQL date, lifecycle stage, source).',
@@ -269,6 +293,34 @@ const TOOLS = [
     }
   },
   {
+    name: 'get_companies_with_contact_properties',
+    description: 'Efficiently fetch companies AND their associated contacts\' properties in a single batch operation — the contact-side mirror of get_companies_with_deal_properties. Use this when the most selective filters are on the company side (e.g. "ICP companies and their key contacts", "non-ICP companies and who we\'ve talked to there") rather than the contact side — for contact-side filters with company context, use get_contacts_with_company_properties instead. A company can have many contacts; each result\'s "contacts" array is capped (default 10, max 25 via max_contacts_per_company) with a "contacts_truncated" flag if more exist. This is an unordered sample, not a "most important" ranking.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        company_filters: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              property: { type: 'string' },
+              operator: { type: 'string', enum: ['EQ', 'NEQ', 'LT', 'LTE', 'GT', 'GTE', 'IN', 'HAS_PROPERTY', 'NOT_HAS_PROPERTY', 'CONTAINS_TOKEN', 'NOT_CONTAINS_TOKEN'] },
+              value: { type: 'string' },
+              high_value: { type: 'string' }
+            },
+            required: ['property', 'operator']
+          }
+        },
+        company_properties: { type: 'array', items: { type: 'string' } },
+        contact_properties: { type: 'array', items: { type: 'string' } },
+        max_contacts_per_company: { type: 'integer', description: 'Max contacts to return per company, 1-25 (default 10).', default: 10 },
+        limit: { type: 'integer', default: 100 },
+        after: { type: 'string', description: 'Pagination cursor from a previous response.' }
+      },
+      required: []
+    }
+  },
+  {
     name: 'count_objects',
     description: 'Get the exact count of objects matching filters WITHOUT returning records. Use for any "how many" question or monthly/periodic breakdown. Returns the accurate total from HubSpot (not capped at 100). Much faster than search_objects when you only need a number.',
     inputSchema: {
@@ -300,6 +352,15 @@ const TOOLS = [
 async function executeTool(name, input, context = {}) {
   try {
     switch (name) {
+
+      case 'list_owners': {
+        const qs = input.email ? `?email=${encodeURIComponent(input.email)}&limit=100` : '?limit=100';
+        const res = await hubspotRequest('GET', `/crm/v3/owners${qs}`);
+        const owners = (res.results || [])
+          .filter(o => !o.archived)
+          .map(o => ({ id: o.id, email: o.email, firstName: o.firstName, lastName: o.lastName }));
+        return { total: owners.length, owners };
+      }
 
       case 'get_object_properties': {
         const res = await hubspotRequest('GET', `/crm/v3/properties/${input.object_type}`);
@@ -517,6 +578,68 @@ async function executeTool(name, input, context = {}) {
         };
       }
 
+      case 'get_companies_with_contact_properties': {
+        const filters = (input.company_filters || []).map(f => ({
+          propertyName: f.property,
+          operator: f.operator,
+          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
+          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
+        }));
+        const companyProps = input.company_properties?.length
+          ? input.company_properties
+          : ['name', 'is_the_company_icp_', 'domain'];
+        const companySearch = await hubspotRequest('POST', '/crm/v3/objects/companies/search', {
+          limit: Math.min(input.limit || 100, 100),
+          properties: companyProps,
+          sorts: [{ propertyName: 'createdate', direction: 'DESCENDING' }],
+          ...(filters.length > 0 ? { filterGroups: [{ filters }] } : {}),
+          ...(input.after ? { after: input.after } : {})
+        });
+        const companies = companySearch.results || [];
+        if (companies.length === 0) return { total: 0, results: [] };
+
+        const assocRes = await hubspotRequest('POST', '/crm/v4/associations/companies/contacts/batch/read', {
+          inputs: companies.map(c => ({ id: c.id }))
+        });
+        const maxPerCompany = Math.min(Math.max(input.max_contacts_per_company || 10, 1), 25);
+        const companyToContacts = {};
+        const contactsTruncated = {};
+        for (const result of (assocRes.results || [])) {
+          const ids = (result.to || []).map(t => t.toObjectId);
+          companyToContacts[result.from.id] = ids.slice(0, maxPerCompany);
+          contactsTruncated[result.from.id] = ids.length > maxPerCompany;
+        }
+        const contactIds = [...new Set(Object.values(companyToContacts).flat())];
+
+        const contactData = {};
+        if (contactIds.length > 0) {
+          const contactProps = input.contact_properties?.length
+            ? input.contact_properties
+            : ['firstname', 'lastname', 'email', 'jobtitle'];
+          for (const idsChunk of chunk(contactIds, 100)) {
+            const contactRes = await hubspotRequest('POST', '/crm/v3/objects/contacts/batch/read', {
+              inputs: idsChunk.map(id => ({ id })),
+              properties: contactProps
+            });
+            for (const c of (contactRes.results || [])) {
+              contactData[c.id] = { id: c.id, ...compactProps(c.properties) };
+            }
+          }
+        }
+
+        return {
+          total: companySearch.total || companies.length,
+          returned: companies.length,
+          truncated: (companySearch.total || 0) > companies.length,
+          after: companySearch.paging?.next?.after || null,
+          results: companies.map(c => ({
+            company: { id: c.id, ...compactProps(c.properties) },
+            contacts: (companyToContacts[c.id] || []).map(id => contactData[id]).filter(Boolean),
+            contacts_truncated: !!contactsTruncated[c.id]
+          }))
+        };
+      }
+
       case 'get_associations': {
         const res = await hubspotRequest('GET', `/crm/v3/objects/${input.object_type}/${input.object_id}/associations/${input.to_object_type}`);
         return { total: (res.results || []).length, ids: (res.results || []).map(r => r.id) };
@@ -526,21 +649,21 @@ async function executeTool(name, input, context = {}) {
         const baseProps = ['firstname', 'lastname', 'email', 'phone', 'company', 'createdate', 'hs_lead_status', 'jobtitle', 'lifecyclestage'];
         const props = [...new Set([...baseProps, ...(input.properties || [])])].join(',');
         const res = await hubspotRequest('GET', `/crm/v3/objects/contacts/${input.contact_id}?properties=${props}`);
-        return { id: res.id, ...res.properties };
+        return { id: res.id, ...compactProps(res.properties) };
       }
 
       case 'get_deal': {
         const baseProps = ['dealname', 'dealstage', 'amount', 'closedate', 'pipeline', 'description'];
         const props = [...new Set([...baseProps, ...(input.properties || [])])].join(',');
         const res = await hubspotRequest('GET', `/crm/v3/objects/deals/${input.deal_id}?properties=${props}`);
-        return { id: res.id, ...res.properties };
+        return { id: res.id, ...compactProps(res.properties) };
       }
 
       case 'get_company': {
         const baseProps = ['name', 'domain', 'industry', 'website', 'city', 'country', 'lifecyclestage', 'is_the_company_icp_', 'mql_date', 'lead_priority'];
         const props = [...new Set([...baseProps, ...(input.properties || [])])].join(',');
         const res = await hubspotRequest('GET', `/crm/v3/objects/companies/${input.company_id}?properties=${props}`);
-        return { id: res.id, ...res.properties };
+        return { id: res.id, ...compactProps(res.properties) };
       }
 
       case 'count_objects': {

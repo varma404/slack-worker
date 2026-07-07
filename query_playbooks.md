@@ -21,6 +21,23 @@ Cross-object contact + company questions:
 For questions needing contact details WITH company properties (name, ICP, revenue), use get_contacts_with_company_properties. This handles the batch lookup in one call.
 Example: "CXOs at ICP companies" → get_contacts_with_company_properties with jobtitle filter + request company is_the_company_icp_ property, then filter results where company.is_the_company_icp_ = Yes.
 
+## Multi-Hop Association Chain Queries
+
+"Contacts at companies that have open deals in stage X", "contacts at companies with an ICP-flagged deal", or any question chaining Contact → Company → Deal (or the reverse):
+1. Anchor the FIRST hop on whichever batch tool lets the real condition run as a HubSpot filter:
+   - If the condition is on the deal (e.g. "deals in stage X"), use get_deals_with_company_properties with deal_filters on dealstage, then take each result's company field.
+   - If the condition is on the company (e.g. "ICP companies"), use get_companies_with_deal_properties with company_filters, then read each result's deals array directly — no second hop needed if that's all the question asks.
+2. Collect the distinct company IDs that pass the condition from step 1.
+3. For the CONTACT hop: there is no batch tool that accepts a company-ID list as input. Call get_associations with object_type: "companies", to_object_type: "contacts" once per qualifying company ID from step 2, then fetch contact details via get_contacts_with_company_properties (filtered by any contact-level condition) or get_contact for the final small set.
+4. This is only efficient when step 1's qualifying-company set is small (roughly under 20-30). If it's larger, report the company-level count and ask the user whether they want the full contact list before looping get_associations across dozens of companies.
+5. Do NOT call get_associations per deal or per contact as a substitute for step 1's batch filter — the batch call must absorb the stage/property condition; get_associations is only for the final company→contact hop, after the company set is already narrowed.
+
+Note: there is no single-call three-hop batch tool (contacts + their company + that company's deals) — this recipe is the most efficient path with current tools.
+
+## Company + Contact Batch Queries
+
+For questions needing company details WITH their contacts (e.g. "ICP companies and their key contacts", "who have we talked to at non-ICP companies"), use get_companies_with_contact_properties. It returns up to max_contacts_per_company (default 10) contacts per company — raise this only if the user needs a near-exhaustive contact list per company. The returned contacts are an unordered sample, not ranked by importance — check contacts_truncated per company before claiming a complete list.
+
 ## CXO / C-Level Search
 
 CXO / C-level title search:
@@ -30,6 +47,29 @@ HubSpot jobtitle is a free-text field. To find C-level contacts, search with CON
 
 Ratio / comparison questions:
 For "X vs Y ratio" or "X vs Y trend", make count_objects calls for each category per time period. Present results as a numbered list with both counts and the calculated ratio/percentage.
+
+## Time-Window Trend / Cohort Queries
+
+"Trend over the last N months/quarters", "month-over-month growth in X", "MQL volume by month":
+1. Break the requested range into individual periods (months, quarters, or weeks) relative to TODAY'S DATE.
+2. Make ONE count_objects call per period with GTE (period start) and LTE (period end) on the correct date property for that metric — never BETWEEN, never one wide-range query.
+3. Pick the date property for the metric being trended, not just createdate:
+   - "MQL volume" / "MQLs by month" → Company, mql_date (GTE/LTE), NOT createdate
+   - "new leads" / "leads created" → Company or Contact, createdate
+   - "deals created" → Deal, createdate
+   - "ICP companies" (a snapshot count, not a dated event) → there is no "became ICP on" date property in this schema; a per-period trend of ICP status is not resolvable from createdate alone — state this limitation rather than approximating with createdate.
+4. For "growth" or "change" between periods, run count_objects for each period being compared, then compute the delta/percentage yourself as reasoning — do not call a tool for the growth calculation itself.
+5. Present the result as a list of period → count (and growth % if requested), using the "total" field from each count_objects response — never tally a results array.
+
+## Group-By / Aggregate Queries
+
+"Total X by Y", "count of X per Y", "Y breakdown" (e.g. "count of open deals per pipeline stage", "companies by industry"):
+1. Enumerate the distinct values of the group-by property: use get_object_properties for a picklist/enum property (dealstage, pipeline, industry, lifecyclestage), or a small search_objects sample for a freeform text property.
+2. Cap the number of distinct-value buckets at 15. If there are more, use the 15 with the highest counts and note in **Notes:** that results are limited to the top 15 — never drop values silently.
+3. Make ONE count_objects call PER distinct value, combining the group-by filter (EQ) with any other filters from the question.
+4. NEVER fetch all matching records in one wide search_objects call and tally the group-by property by reading each record — you will miscount past the 100-result cap, same as the monthly-breakdown rule above.
+5. Present as a table or ranked list: value, count, percent of total if useful. Sort descending unless the user specifies an order.
+6. SUM-based aggregates (e.g. "total deal amount by industry") are NOT currently supported — HubSpot's search API returns exact counts but not sums, and summing would require paginating every matching record client-side. Say so explicitly if asked rather than attempting a manual sum.
 
 ## Revenue Context
 
@@ -63,3 +103,11 @@ For contact-level funnel attribution (e.g. "leads from source X → MQL → firs
 1. Leads: contacts matching the source filter (createdate range + source property)
 2. MQL: associated Company has mql_date IS NOT NULL
 3. First meeting happened: associated Company has a deal in pipeline = default with dealstage IN (appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon, closedlost, 217786505, 175509306, 175526434)
+
+## Ownership / Attribution Queries
+
+"How many open deals does [person] own?", "deals owned by [name]", "[name]'s pipeline":
+1. Ownership is tracked via hubspot_owner_id on the relevant object (deals, contacts, or companies) — confirm the exact property name with get_object_properties if unsure.
+2. To resolve a name (e.g. "Sarah") to an owner ID, call list_owners and match firstName/lastName or email — there is no name-based filter on HubSpot's owners API, so fetch the list and match yourself. If more than one owner matches ambiguously, ask the user to disambiguate rather than guessing.
+3. Filter using the resolved ID: count_objects or search_objects with { property: "hubspot_owner_id", operator: "EQ", value: "<owner id>" }, combined with any other conditions (e.g. dealstage NOT IN closed stages, for "open deals").
+4. Do not confuse hubspot_owner_id (record owner — a sales rep) with fields like hs_lead_status or notes_last_contacted, which describe outreach state, not ownership.
