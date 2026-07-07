@@ -80,6 +80,17 @@ function toHubSpotValue(v) {
   return v;
 }
 
+// Drops null/empty-string property values before a HubSpot record is
+// returned to Claude — these carry no signal but otherwise get resent in
+// full on every loop iteration of a multi-step query.
+function compactProps(props) {
+  const out = {};
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v !== null && v !== undefined && v !== '') out[k] = v;
+  }
+  return out;
+}
+
 // ─── Tool Definitions ─────────────────────────────────────────────────────────
 
 const TOOLS = [
@@ -147,6 +158,33 @@ const TOOLS = [
         },
         deal_properties: { type: 'array', items: { type: 'string' } },
         company_properties: { type: 'array', items: { type: 'string' } },
+        limit: { type: 'integer', default: 100 },
+        after: { type: 'string', description: 'Pagination cursor from a previous response to get the next page.' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'get_companies_with_deal_properties',
+    description: 'Efficiently fetch companies AND their associated deals\' properties in a single batch operation — the reverse direction of get_deals_with_company_properties. Use this when the MOST SELECTIVE filters are on the company side (e.g. "non-ICP companies MQL\'d in 2026 sourced from marketing") rather than the deal side. A company can have multiple deals, so each result has a "deals" array. For cross-object MISMATCH questions (e.g. "deal marked ICP but company marked non-ICP"), pick whichever side (this tool vs get_deals_with_company_properties) has the more selective filters as the search anchor, then check the other side\'s condition on the returned batch yourself — do NOT call get_deal/get_company repeatedly to check records one at a time.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        company_filters: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              property: { type: 'string' },
+              operator: { type: 'string', enum: ['EQ', 'NEQ', 'LT', 'LTE', 'GT', 'GTE', 'IN', 'HAS_PROPERTY', 'NOT_HAS_PROPERTY', 'CONTAINS_TOKEN', 'NOT_CONTAINS_TOKEN'] },
+              value: { type: 'string' },
+              high_value: { type: 'string' }
+            },
+            required: ['property', 'operator']
+          }
+        },
+        company_properties: { type: 'array', items: { type: 'string' } },
+        deal_properties: { type: 'array', items: { type: 'string' } },
         limit: { type: 'integer', default: 100 },
         after: { type: 'string', description: 'Pagination cursor from a previous response to get the next page.' }
       },
@@ -308,7 +346,7 @@ async function executeTool(name, input, context = {}) {
           returned,
           truncated: total > returned,
           after: res.paging?.next?.after || null,
-          results: res.results?.map(r => ({ id: r.id, ...r.properties }))
+          results: res.results?.map(r => ({ id: r.id, ...compactProps(r.properties) }))
         };
       }
 
@@ -352,7 +390,7 @@ async function executeTool(name, input, context = {}) {
             properties: companyProps
           });
           for (const c of (companyRes.results || [])) {
-            companyData[c.id] = { id: c.id, ...c.properties };
+            companyData[c.id] = { id: c.id, ...compactProps(c.properties) };
           }
         }
 
@@ -362,8 +400,63 @@ async function executeTool(name, input, context = {}) {
           truncated: (dealSearch.total || 0) > deals.length,
           after: dealSearch.paging?.next?.after || null,
           results: deals.map(d => ({
-            deal: { id: d.id, ...d.properties },
+            deal: { id: d.id, ...compactProps(d.properties) },
             company: dealToCompany[d.id] ? companyData[dealToCompany[d.id]] || null : null
+          }))
+        };
+      }
+
+      case 'get_companies_with_deal_properties': {
+        const filters = (input.company_filters || []).map(f => ({
+          propertyName: f.property,
+          operator: f.operator,
+          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
+          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
+        }));
+        const companyProps = input.company_properties?.length
+          ? input.company_properties
+          : ['name', 'is_the_company_icp_', 'domain'];
+        const companySearch = await hubspotRequest('POST', '/crm/v3/objects/companies/search', {
+          limit: Math.min(input.limit || 100, 100),
+          properties: companyProps,
+          sorts: [{ propertyName: 'createdate', direction: 'DESCENDING' }],
+          ...(filters.length > 0 ? { filterGroups: [{ filters }] } : {}),
+          ...(input.after ? { after: input.after } : {})
+        });
+        const companies = companySearch.results || [];
+        if (companies.length === 0) return { total: 0, results: [] };
+
+        const assocRes = await hubspotRequest('POST', '/crm/v4/associations/companies/deals/batch/read', {
+          inputs: companies.map(c => ({ id: c.id }))
+        });
+        const companyToDeals = {};
+        for (const result of (assocRes.results || [])) {
+          companyToDeals[result.from.id] = (result.to || []).map(t => t.toObjectId);
+        }
+        const dealIds = [...new Set(Object.values(companyToDeals).flat())];
+
+        const dealData = {};
+        if (dealIds.length > 0) {
+          const dealProps = input.deal_properties?.length
+            ? input.deal_properties
+            : ['dealname', 'dealstage', 'amount', 'closedate', 'createdate'];
+          const dealRes = await hubspotRequest('POST', '/crm/v3/objects/deals/batch/read', {
+            inputs: dealIds.map(id => ({ id })),
+            properties: dealProps
+          });
+          for (const d of (dealRes.results || [])) {
+            dealData[d.id] = { id: d.id, ...compactProps(d.properties) };
+          }
+        }
+
+        return {
+          total: companySearch.total || companies.length,
+          returned: companies.length,
+          truncated: (companySearch.total || 0) > companies.length,
+          after: companySearch.paging?.next?.after || null,
+          results: companies.map(c => ({
+            company: { id: c.id, ...compactProps(c.properties) },
+            deals: (companyToDeals[c.id] || []).map(id => dealData[id]).filter(Boolean)
           }))
         };
       }
@@ -408,7 +501,7 @@ async function executeTool(name, input, context = {}) {
             properties: companyProps
           });
           for (const c of (companyRes.results || [])) {
-            companyData[c.id] = { id: c.id, ...c.properties };
+            companyData[c.id] = { id: c.id, ...compactProps(c.properties) };
           }
         }
 
@@ -418,7 +511,7 @@ async function executeTool(name, input, context = {}) {
           truncated: (contactSearch.total || 0) > contacts.length,
           after: contactSearch.paging?.next?.after || null,
           results: contacts.map(c => ({
-            contact: { id: c.id, ...c.properties },
+            contact: { id: c.id, ...compactProps(c.properties) },
             company: contactToCompany[c.id] ? companyData[contactToCompany[c.id]] || null : null
           }))
         };
