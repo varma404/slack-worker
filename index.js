@@ -222,6 +222,21 @@ function addUsage(totals, usage) {
   totals.cache_creation_input_tokens += usage.cache_creation_input_tokens || 0;
 }
 
+// Anthropic caps a request at 4 total cache_control breakpoints. The system
+// prompt uses 1, so at most 1 more may exist at any time — this clears any
+// previously-set rolling breakpoint (see askClaude) before a new one is
+// added, otherwise every loop iteration piles on another marker and a
+// question needing more than ~3 tool calls 400s with "A maximum of 4 blocks
+// with cache_control may be provided."
+function clearCacheBreakpoints(messages) {
+  for (const msg of messages) {
+    if (!Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block && block.cache_control) delete block.cache_control;
+    }
+  }
+}
+
 // Shared by both the iteration cap and the hard cost ceiling: asks Claude to
 // summarize whatever was found so far instead of just refusing outright, so
 // hitting either limit still produces a genuinely useful partial answer.
@@ -334,7 +349,12 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}, st
     // from all prior iterations at full price. Marking the last block of
     // each turn cacheable means only the new content since the last
     // breakpoint costs full price — everything before reads from cache.
-    if (toolResults.length) toolResults[toolResults.length - 1].cache_control = { type: 'ephemeral' };
+    // Clear the previous breakpoint first — only one may exist at a time
+    // (see clearCacheBreakpoints).
+    if (toolResults.length) {
+      clearCacheBreakpoints(messages);
+      toolResults[toolResults.length - 1].cache_control = { type: 'ephemeral' };
+    }
     messages.push({ role: 'user', content: toolResults });
   }
 
