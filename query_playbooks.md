@@ -7,6 +7,14 @@ The Sales Pipeline stage order is: Objective Win → Functional Win → Value Wi
 "Moved past Objective Win" means the deal's current dealstage is any stage AFTER Objective Win: qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon.
 Use the IN operator with all stages past the named one. Do NOT include closedlost, MQO, DQ, Sales Nurture, or Dead/Duplicate — those are exit paths, not progression.
 
+## Cross-Object Mismatch Queries
+
+Questions comparing a property on one object against a property on its associated object (e.g. "deals marked ICP but the company is marked non-ICP", "contacts flagged as X but their company says Y"):
+1. Identify which side's OWN filters are more selective — usually whichever side has more distinct conditions stacked together (e.g. "non-ICP AND MQL'd in 2026 AND sourced from marketing" on the company side is far more selective than "ICP = Yes" alone on the deal side).
+2. Use the batch tool anchored on that more-selective side: `get_companies_with_deal_properties` (company-side filters, returns each company's associated deals) or `get_deals_with_company_properties` (deal-side filters, returns each deal's associated company) — whichever pushes the most conditions down as real HubSpot filters.
+3. Fetch that one batch, then do the actual mismatch check (comparing the two objects' property values) yourself across the returned records — this is reasoning, not another tool call.
+4. NEVER call `get_deal` or `get_company` more than 2-3 times in a row to check individual records against a condition — if you find yourself doing this, stop and restructure the query as a batch call on the more selective side instead. Repeated single-record lookups don't scale and burn far more tokens than a single batch call.
+
 ## Cross-Object Contact + Company Queries
 
 Cross-object contact + company questions:

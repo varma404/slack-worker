@@ -72,6 +72,7 @@ const TOOL_STATUS = {
   get_object_properties: 'Reading the CRM schema...',
   search_objects: 'Querying the pipeline...',
   get_deals_with_company_properties: 'Pulling deals and accounts...',
+  get_companies_with_deal_properties: 'Pulling accounts and deals...',
   get_contacts_with_company_properties: 'Pulling contacts and accounts...',
   get_associations: 'Connecting the dots...',
   get_contact: 'Fetching the record...',
@@ -200,4 +201,5 @@ module.exports = {
   uploadFile,
   buildAnswerBlocks,
   getToolStatus,
+  estimateCostUsd,
 };

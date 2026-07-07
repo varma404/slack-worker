@@ -9,7 +9,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { App } = require('@slack/bolt');
 const { TOOLS: MCP_TOOLS, executeTool } = require('./hubspot-mcp-server');
 const { log } = require('./logger');
-const { slackRequest, uploadFile, buildAnswerBlocks, getToolStatus } = require('./slack-client');
+const { slackRequest, uploadFile, buildAnswerBlocks, getToolStatus, estimateCostUsd } = require('./slack-client');
 const {
   isDuplicate,
   getCached,
@@ -40,20 +40,32 @@ if (missingEnvVars.length > 0) {
 // ─── Claude Client & System Prompt ──────────────────────────────────────────
 
 const anthropic = new Anthropic();
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5';
+// Medium effort is enough for this deterministic, narrowly-scoped CRM
+// lookup task given how prescriptive the system prompt already is —
+// `high` (Sonnet 5's default) costs meaningfully more for no quality gain
+// here. Adjustable via env var without a redeploy if quality suffers.
+const CLAUDE_EFFORT = process.env.CLAUDE_EFFORT || 'medium';
 
 const SARAS_CONTEXT = fs.readFileSync(path.join(__dirname, 'saras_context.md'), 'utf8');
 const QUERY_PLAYBOOKS = fs.readFileSync(path.join(__dirname, 'query_playbooks.md'), 'utf8');
 
-// NOTE: prompt caching (cache_control on the static block) is intentionally
-// NOT enabled yet. It was reintroduced in a follow-up commit but is being
-// held back as a plain string for a few days so the tool_use/tool_result
-// pairing fix (see storeThreadMessages) can be verified in production
-// first — re-enable once confirmed stable (see PR #1 for full context).
+// Prompt caching: the static body (business rules + SARAS_CONTEXT +
+// QUERY_PLAYBOOKS — several thousand tokens, byte-identical across every
+// request) is cached separately from the per-request date/addendum suffix,
+// which changes daily and would otherwise invalidate the whole cache if it
+// were part of the same block. This was held back as a single plain string
+// during the tool_use/tool_result pairing-fix soak period (see PR #1) —
+// that fix has since been stable across multiple days of real production
+// traffic, so it's safe to re-enable now.
 function buildSystemPrompt(addendum = null) {
   const today = new Date().toISOString().split('T')[0];
-  let prompt = `${buildStaticPromptBody()}\n\nTODAY'S DATE: ${today}\nWhen the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.`;
-  if (addendum) prompt += `\n\n${addendum}`;
-  return prompt;
+  let suffix = `TODAY'S DATE: ${today}\nWhen the user says "this month", "last 3 months", "this year", "last quarter", etc., calculate the exact date range relative to ${today}. Never fall back to dates from your training data.`;
+  if (addendum) suffix += `\n\n${addendum}`;
+  return [
+    { type: 'text', text: buildStaticPromptBody(), cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: suffix },
+  ];
 }
 
 function buildStaticPromptBody() {
@@ -110,8 +122,9 @@ Do NOT use this prefix for anything except a genuine blocking ambiguity. Do NOT 
 
 TOOL SELECTION RULES:
 - For "how many" / count questions, use count_objects — it returns exact totals without fetching records. For breakdowns by time period, call count_objects once per period.
-- For ANY question involving BOTH deals AND company properties (ICP status, company name, industry, revenue, etc.) → use get_deals_with_company_properties. This is a single batch call. Do NOT use get_associations one-by-one for this.
+- For ANY question involving BOTH deals AND company properties (ICP status, company name, industry, revenue, etc.) → use get_deals_with_company_properties (deal-side filters) or get_companies_with_deal_properties (company-side filters) — pick whichever side's filters are more selective as the search anchor. See the Cross-Object Mismatch Queries playbook below for questions comparing a deal's property against its company's property. Do NOT use get_associations one-by-one for this.
 - For ANY question involving contacts WITH company properties (ICP status, company name, revenue) → use get_contacts_with_company_properties. Same batch pattern.
+- NEVER call get_deal/get_company/get_contact more than 2-3 times in a row to check individual records against a filter — that pattern means the query should be restructured as a single batch call instead. Repeated single-record lookups don't scale and burn far more tokens than one batch call would.
 - Use search_objects for single-object queries with no cross-object property filtering.
 - Use get_associations only when you need a one-off relationship lookup for a single record.
 - NEVER use the BETWEEN operator for ANY range query (dates, numbers, revenue, etc.) — it is unreliable on HubSpot properties. Instead, use two separate filters: GTE for the lower bound and LTE for the upper bound.
@@ -209,6 +222,34 @@ function addUsage(totals, usage) {
   totals.cache_creation_input_tokens += usage.cache_creation_input_tokens || 0;
 }
 
+// Shared by both the iteration cap and the hard cost ceiling: asks Claude to
+// summarize whatever was found so far instead of just refusing outright, so
+// hitting either limit still produces a genuinely useful partial answer.
+async function generatePartialSummary(messages, threadKey, usage, reasonAddendum) {
+  const FALLBACK_TEXT = 'Reached maximum iterations — try a more specific question.';
+  try {
+    const summaryResp = await anthropic.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 2000,
+      // On Sonnet 5, omitting `thinking` now defaults to adaptive (was
+      // thinking-off on 4.6) — disable it explicitly here so the tight
+      // 2000-token budget goes entirely to the summary text, not reasoning.
+      thinking: { type: 'disabled' },
+      output_config: { effort: CLAUDE_EFFORT },
+      system: buildSystemPrompt(reasonAddendum),
+      tools: anthropicTools,
+      tool_choice: { type: 'none' },
+      messages,
+    });
+    addUsage(usage, summaryResp.usage);
+    const text = summaryResp.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+    return text || FALLBACK_TEXT;
+  } catch (err) {
+    log('ERROR', 'partial_progress_summary_failed', { correlation_id: threadKey, error: err.message });
+    return FALLBACK_TEXT;
+  }
+}
+
 async function askClaude(question, threadKey, statusUpdater = async () => {}, streamUpdater = async () => {}, sendFile = async () => ({ error: 'file sending not available on this path' })) {
   await statusUpdater('Analyzing your request...');
 
@@ -221,6 +262,20 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}, st
 
   const loopStartTs = Date.now();
   const MAX_LOOP_MS = 100_000;
+  // Two-tier cost guard, not a single flat cutoff — a hard cutoff alone
+  // can't tell "expensive because inefficient" apart from "expensive
+  // because genuinely complex," and would refuse both identically. Once
+  // SOFT_BUDGET_USD is crossed, the model gets a wrap-up nudge (via the
+  // uncached suffix of buildSystemPrompt, so it doesn't touch the cached
+  // system prompt) and keeps going — most legitimately complex questions
+  // finish here. Only if HARD_BUDGET_USD is still crossed after that does
+  // the loop actually stop, and even then it produces a partial answer via
+  // generatePartialSummary rather than a blunt refusal. $0.75 (not $1)
+  // leaves headroom for that trailing summary call itself.
+  const SOFT_BUDGET_USD = 0.35;
+  const HARD_BUDGET_USD = 0.75;
+  const WRAP_UP_ADDENDUM = "You're approaching this question's budget — finish efficiently: use the most direct remaining tool calls, avoid redundant lookups, and give your best answer soon.";
+  let nearBudget = false;
   let iterations = 0;
   while (iterations++ < 25) {
     if (Date.now() - loopStartTs > MAX_LOOP_MS) {
@@ -229,16 +284,29 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}, st
       return { text: 'This is taking too long — try narrowing your question.', usage };
     }
     const response = await anthropic.messages.create({
-      model: process.env.CLAUDE_MODEL || 'claude-sonnet-5',
+      model: CLAUDE_MODEL,
       max_tokens: 16000,
       // Sonnet 5 rejects the old fixed-budget form (`enabled` + `budget_tokens`)
       // with a 400 — adaptive thinking is the only supported "on" mode now.
       thinking: { type: 'adaptive' },
-      system: buildSystemPrompt(),
+      output_config: { effort: CLAUDE_EFFORT },
+      system: buildSystemPrompt(nearBudget ? WRAP_UP_ADDENDUM : null),
       tools: anthropicTools,
       messages,
     });
     addUsage(usage, response.usage);
+
+    const estCost = estimateCostUsd(usage, CLAUDE_MODEL);
+    if (estCost > HARD_BUDGET_USD) {
+      log('WARN', 'agent_loop_cost_exceeded', { correlation_id: threadKey, iterations, estCost });
+      storeThreadMessages(threadKey, messages);
+      const text = await generatePartialSummary(messages, threadKey, usage, 'This question has exceeded its cost budget for a single request. Do NOT call any more tools. Summarize what you found so far using the **Answer:** / **Filters applied:** / **Notes:** structure, but replace **Answer:** with **Partial answer (cost budget reached):** and use **Notes:** to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).');
+      return { text, usage };
+    }
+    if (!nearBudget && estCost > SOFT_BUDGET_USD) {
+      nearBudget = true;
+      log('INFO', 'agent_loop_near_budget', { correlation_id: threadKey, iterations, estCost });
+    }
 
     const contentWithoutThinking = response.content.filter(b => b.type !== 'thinking');
     messages.push({ role: 'assistant', content: contentWithoutThinking });
@@ -261,33 +329,20 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}, st
       await streamUpdater('complete', block.name, block.input, !result.error);
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
     }
+    // Rolling cache breakpoint: without this, every iteration of a
+    // multi-step query re-bills the entire accumulated tool-result history
+    // from all prior iterations at full price. Marking the last block of
+    // each turn cacheable means only the new content since the last
+    // breakpoint costs full price — everything before reads from cache.
+    if (toolResults.length) toolResults[toolResults.length - 1].cache_control = { type: 'ephemeral' };
     messages.push({ role: 'user', content: toolResults });
   }
 
   log('WARN', 'agent_loop_iteration_cap', { correlation_id: threadKey, iterations, question });
   storeThreadMessages(threadKey, messages);
 
-  const FALLBACK_TEXT = 'Reached maximum iterations — try a more specific question.';
-  try {
-    const summaryResp = await anthropic.messages.create({
-      model: process.env.CLAUDE_MODEL || 'claude-sonnet-5',
-      max_tokens: 2000,
-      // On Sonnet 5, omitting `thinking` now defaults to adaptive (was
-      // thinking-off on 4.6) — disable it explicitly here so the tight
-      // 2000-token budget goes entirely to the summary text, not reasoning.
-      thinking: { type: 'disabled' },
-      system: buildSystemPrompt('You have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the **Answer:** / **Filters applied:** / **Notes:** structure, but replace **Answer:** with **Partial answer (ran out of steps):** and use **Notes:** to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).'),
-      tools: anthropicTools,
-      tool_choice: { type: 'none' },
-      messages,
-    });
-    addUsage(usage, summaryResp.usage);
-    const text = summaryResp.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-    return { text: text || FALLBACK_TEXT, usage };
-  } catch (err) {
-    log('ERROR', 'partial_progress_summary_failed', { correlation_id: threadKey, error: err.message });
-    return { text: FALLBACK_TEXT, usage };
-  }
+  const text = await generatePartialSummary(messages, threadKey, usage, 'You have run out of tool-call budget for this request. Do NOT call any more tools. Summarize what you found so far using the **Answer:** / **Filters applied:** / **Notes:** structure, but replace **Answer:** with **Partial answer (ran out of steps):** and use **Notes:** to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).');
+  return { text, usage };
 }
 
 function trimToAnswer(text) {
