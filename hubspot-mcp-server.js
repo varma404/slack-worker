@@ -104,6 +104,22 @@ function chunk(arr, size) {
   return out;
 }
 
+// Drops IN filters with no value instead of forwarding them to HubSpot,
+// which rejects the entire request with "operator IN requires values".
+function buildHubSpotFilters(filterList) {
+  return (filterList || [])
+    .map(f => {
+      if (f.operator === 'IN' && !f.value) return null;
+      return {
+        propertyName: f.property,
+        operator: f.operator,
+        ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
+        ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
+      };
+    })
+    .filter(Boolean);
+}
+
 // ─── Tool Definitions ─────────────────────────────────────────────────────────
 
 const TOOLS = [
@@ -378,12 +394,7 @@ async function executeTool(name, input, context = {}) {
       }
 
       case 'search_objects': {
-        const filters = (input.filters || []).map(f => ({
-          propertyName: f.property,
-          operator: f.operator,
-          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
-          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
-        }));
+        const filters = buildHubSpotFilters(input.filters);
         const defaultProps = {
           contacts: ['firstname', 'lastname', 'email', 'createdate', 'lifecyclestage', 'hs_lead_status'],
           companies: ['name', 'domain', 'createdate', 'lifecyclestage', 'mql_date', 'is_the_company_icp_'],
@@ -412,12 +423,7 @@ async function executeTool(name, input, context = {}) {
       }
 
       case 'get_deals_with_company_properties': {
-        const filters = (input.deal_filters || []).map(f => ({
-          propertyName: f.property,
-          operator: f.operator,
-          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
-          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
-        }));
+        const filters = buildHubSpotFilters(input.deal_filters);
         const dealProps = input.deal_properties?.length
           ? input.deal_properties
           : ['dealname', 'dealstage', 'amount', 'closedate', 'createdate'];
@@ -468,12 +474,7 @@ async function executeTool(name, input, context = {}) {
       }
 
       case 'get_companies_with_deal_properties': {
-        const filters = (input.company_filters || []).map(f => ({
-          propertyName: f.property,
-          operator: f.operator,
-          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
-          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
-        }));
+        const filters = buildHubSpotFilters(input.company_filters);
         const companyProps = input.company_properties?.length
           ? input.company_properties
           : ['name', 'is_the_company_icp_', 'domain'];
@@ -523,12 +524,7 @@ async function executeTool(name, input, context = {}) {
       }
 
       case 'get_contacts_with_company_properties': {
-        const filters = (input.contact_filters || []).map(f => ({
-          propertyName: f.property,
-          operator: f.operator,
-          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
-          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
-        }));
+        const filters = buildHubSpotFilters(input.contact_filters);
         const contactProps = input.contact_properties?.length
           ? input.contact_properties
           : ['firstname', 'lastname', 'email', 'jobtitle', 'createdate', 'hs_linkedin_url'];
@@ -579,12 +575,7 @@ async function executeTool(name, input, context = {}) {
       }
 
       case 'get_companies_with_contact_properties': {
-        const filters = (input.company_filters || []).map(f => ({
-          propertyName: f.property,
-          operator: f.operator,
-          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
-          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
-        }));
+        const filters = buildHubSpotFilters(input.company_filters);
         const companyProps = input.company_properties?.length
           ? input.company_properties
           : ['name', 'is_the_company_icp_', 'domain'];
@@ -667,12 +658,7 @@ async function executeTool(name, input, context = {}) {
       }
 
       case 'count_objects': {
-        const filters = (input.filters || []).map(f => ({
-          propertyName: f.property,
-          operator: f.operator,
-          ...(f.value !== undefined ? { value: f.operator === 'IN' ? f.value.replace(/,\s*/g, ';') : toHubSpotValue(f.value) } : {}),
-          ...(f.high_value !== undefined ? { highValue: toHubSpotValue(f.high_value) } : {})
-        }));
+        const filters = buildHubSpotFilters(input.filters);
         const body = {
           limit: 1,
           properties: ['hs_object_id'],
