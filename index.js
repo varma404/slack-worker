@@ -125,6 +125,7 @@ TOOL SELECTION RULES:
 - For ANY question involving BOTH deals AND company properties (ICP status, company name, industry, revenue, etc.) → use get_deals_with_company_properties (deal-side filters) or get_companies_with_deal_properties (company-side filters) — pick whichever side's filters are more selective as the search anchor. See the Cross-Object Mismatch Queries playbook below for questions comparing a deal's property against its company's property. Do NOT use get_associations one-by-one for this.
 - For ANY question involving contacts WITH company properties (ICP status, company name, revenue) → use get_contacts_with_company_properties. Same batch pattern.
 - NEVER call get_deal/get_company/get_contact more than 2-3 times in a row to check individual records against a filter — that pattern means the query should be restructured as a single batch call instead. Repeated single-record lookups don't scale and burn far more tokens than one batch call would.
+- If you already fetched records via a batch tool this turn and need ONE more property you forgot to request, re-run the SAME batch call with an expanded properties list — do NOT fetch the missing property via repeated get_contact/get_deal/get_company calls, even one at a time.
 - For company-level questions needing associated contacts (e.g. "ICP companies and their key contacts") → use get_companies_with_contact_properties. Same batch pattern as get_companies_with_deal_properties.
 - For "total/count by [property]" breakdown questions (e.g. "deals by stage", "companies by industry") → see the Group-By / Aggregate Queries playbook below. Do NOT fetch all matching records and tally the group-by property yourself.
 - For owner/rep attribution questions ("who owns this", "[name]'s deals") → see the Ownership / Attribution Queries playbook below; resolve names to IDs via list_owners first — there is no name-based owner filter.
@@ -299,7 +300,8 @@ async function askClaude(question, threadKey, statusUpdater = async () => {}, st
     if (Date.now() - loopStartTs > MAX_LOOP_MS) {
       log('WARN', 'agent_loop_time_exceeded', { correlation_id: threadKey, iterations, elapsedMs: Date.now() - loopStartTs });
       storeThreadMessages(threadKey, messages);
-      return { text: 'This is taking too long — try narrowing your question.', usage };
+      const text = await generatePartialSummary(messages, threadKey, usage, 'This question is taking too long to resolve fully. Do NOT call any more tools. Summarize what you found so far using the **Answer:** / **Filters applied:** / **Notes:** structure, but replace **Answer:** with **Partial answer (time budget reached):** and use **Notes:** to say exactly what part of the question you were not able to finish and what the user could do to get a complete answer (e.g. narrow the date range, split into two questions).');
+      return { text, usage };
     }
     const response = await anthropic.messages.create({
       model: CLAUDE_MODEL,

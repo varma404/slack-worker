@@ -52,7 +52,7 @@ Saras business metrics and their exact HubSpot filter rules. Start here for any 
 
 ## SECTION 1B — TERM ALIASES & COMMON MISTAKES
 
-When a user uses natural language terms, map them as follows. The **Do NOT** rules are critical — these are the wrong properties Claude would otherwise guess. These aliases are for natural-language phrasing — if the user's wording looks like it's quoting an exact property label (specific casing, units like "(USD)", quotation marks), verify that literal property exists via `get_object_properties` first; a real matching HubSpot property wins over the heuristic mapping below.
+When a user uses natural language terms, map them as follows. The **Do NOT** rules are critical — these are the wrong properties Claude would otherwise guess. These aliases are for natural-language phrasing — if the user's wording looks like it's quoting an exact property label (specific casing, units like "(USD)", quotation marks), verify that literal property exists via `get_object_properties` first (once per object type for this question — reuse the result, don't re-check it); a real matching HubSpot property wins over the heuristic mapping below.
 
 | User Says | Correct Property | Object | Do NOT Use |
 |---|---|---|---|
