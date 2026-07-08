@@ -140,7 +140,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'], description: 'The CRM object type' },
+        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals', 'meetings'], description: 'The CRM object type' },
         query: { type: 'string', description: 'Optional search term to filter properties by name or label.' },
         include_internal: { type: 'boolean', description: 'Include HubSpot internal (hs_) properties. Default false.', default: false }
       },
@@ -153,7 +153,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'], description: 'The CRM object type to search' },
+        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals', 'meetings'], description: 'The CRM object type to search' },
         filters: {
           type: 'array',
           description: 'Filters — all AND\'d together',
@@ -237,9 +237,9 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'] },
+        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals', 'meetings'] },
         object_id: { type: 'string' },
-        to_object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'] }
+        to_object_type: { type: 'string', enum: ['contacts', 'companies', 'deals', 'meetings'] }
       },
       required: ['object_type', 'object_id', 'to_object_type']
     }
@@ -342,7 +342,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals'], description: 'The CRM object type to count' },
+        object_type: { type: 'string', enum: ['contacts', 'companies', 'deals', 'meetings'], description: 'The CRM object type to count' },
         filters: {
           type: 'array',
           description: 'Filters — all AND\'d together',
@@ -398,7 +398,8 @@ async function executeTool(name, input, context = {}) {
         const defaultProps = {
           contacts: ['firstname', 'lastname', 'email', 'createdate', 'lifecyclestage', 'hs_lead_status'],
           companies: ['name', 'domain', 'createdate', 'lifecyclestage', 'mql_date', 'is_the_company_icp_'],
-          deals: ['dealname', 'dealstage', 'amount', 'closedate', 'pipeline']
+          deals: ['dealname', 'dealstage', 'amount', 'closedate', 'pipeline'],
+          meetings: ['hs_timestamp', 'hs_meeting_title', 'hs_meeting_start_time', 'hs_meeting_end_time']
         };
         const properties = input.properties?.length
           ? input.properties
