@@ -87,7 +87,8 @@ FIRST MEETING HAPPENED — correct definition:
 A company/deal had their first meeting if they have a deal in pipeline = default at ANY stage EXCEPT:
   - MQO (152224771) — meeting was SCHEDULED but prospect NO-SHOWED → does NOT count as first meeting
   - Dead/Duplicate (28023967) — stale or invalid, no meeting implied
-  - Junk — invalid lead
+
+Note: junk leads never get a deal created, so "Junk" is not a dealstage and doesn't need excluding here.
 
 Full "first meeting happened" dealstage IN list (use this):
   appointmentscheduled, qualifiedtobuy, presentationscheduled, 28218292, contractsent,
@@ -98,14 +99,14 @@ This correctly includes Sales Nurture (217786505), DQ (175509306), Closed Lost, 
 MILESTONE REACHED IN A TIME WINDOW ("meetings booked in the last N days", "deals that reached Commercial Win this month"):
 The definitions above tell you CURRENT status only, not WHEN a deal entered that stage — dealstage has no built-in transition timestamp, and deal-stage proxies only capture events that already have a deal record.
 - "Meetings booked" / "first meeting happened" in [period] → this is an MQL-engagement concept for Saras, not a raw activity count. Check in this order, stopping at the first tier with real data — do NOT combine tiers in one answer, and say in **Notes:** which tier you used:
-  1. CURATED PROPERTY (preferred): call get_object_properties ONCE each on Contact and Company with query: "meeting" — look for a label resembling "Last Booked Meeting Date" or "Date of last meeting booked in meetings tool". If found, filter GTE/LTE the period on that property.
+  1. CURATED PROPERTY (preferred): filter GTE/LTE the period on hs_last_booked_meeting_date (Company) or engagements_last_meeting_booked (Contact) — these are the confirmed properties for this metric, no need to search for them.
   2. RAW MEETINGS OBJECT (fallback): only if no curated property exists, call get_object_properties ONCE with object_type: "meetings", include_internal: true to confirm the timestamp property (commonly hs_timestamp), then filter GTE/LTE the period via search_objects/count_objects with object_type: "meetings". Sanity-check the result against a related trusted metric (MQL or open-deal count) in the same window before reporting it — if drastically higher, say so explicitly rather than presenting it as authoritative.
   3. DEAL-STAGE PROXY (last resort): hs_date_entered_appointmentscheduled on Deal — say explicitly that this only counts meetings that already have an associated deal.
 - For other milestones ("reached Commercial Win", "hit Closed Won"), use that specific stage's own hs_date_entered_<stageId> — the Meetings-object preference above is specific to "meetings booked", not other pipeline milestones.
 - If neither is available, do NOT silently substitute createdate (that's when the deal record was created, not when it reached the stage) — say so explicitly in **Notes:** and offer the closest honest alternative as an explicit choice.
 
 For deeper funnel milestones:
-  - "SQL / Functional Win reached" → dealstage IN: qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon, closedlost, 217786505
+  - "SQL / Functional Win reached" → dealstage IN: qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon, closedlost, 217786505, 175526434
   - "Demo / Value Win reached" → dealstage IN: presentationscheduled, 28218292, contractsent, closedwon, closedlost
 
 For contact-level funnel attribution (e.g. "leads from source X → MQL → first meeting"):

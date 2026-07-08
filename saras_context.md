@@ -3,7 +3,7 @@ title: Saras HubSpot Context Layer
 purpose: Semantic context layer for the Saras HubSpot CRM Agent
 version: 2.0
 objects: [Company, Contact, Deal]
-key_metrics: [MQL, ICP_MQL, SQL, MQO, ICP, Lead_Priority, Pipeline, ARR]
+key_metrics: [MQL, ICP_MQL, SQL, MQO, ICP, Pipeline, ARR]
 last_verified: 2026-06-20
 ---
 
@@ -13,9 +13,9 @@ last_verified: 2026-06-20
 >
 > This file is a **semantic context layer**, not a capability boundary.
 >
-> **USE THIS FILE** to interpret Saras-specific business terms (MQL, ICP, SQL, Lead Priority, etc.) and to know the correct internal property names and enum values for custom Saras properties.
+> **USE THIS FILE** to interpret Saras-specific business terms (MQL, ICP, SQL, etc.) and to know the correct internal property names and enum values for custom Saras properties.
 >
-> **FOR ALL OTHER QUESTIONS**: use your tools directly (`search_objects`, `count_objects`, `get_object_properties`, `get_deals_with_company_properties`, `get_contacts_with_company_properties`, `get_company`, `get_contact`, `get_deal`, `get_associations`). You are NOT limited to properties or queries listed here.
+> **FOR ALL OTHER QUESTIONS**: use whichever of your available HubSpot tools fits the question. This file does not gate or limit which tools or properties you can use — it only adds business-term definitions for Saras-specific concepts that aren't otherwise obvious from the CRM data itself.
 >
 > **Example of how to combine both:**
 > *"List CXOs my team has spoken to in the last 3 months who are ICP with their brand name and LinkedIn"*
@@ -35,16 +35,12 @@ Saras business metrics and their exact HubSpot filter rules. Start here for any 
 |---|---|---|---|
 | **MQL** | Company | `mql_date` IS NOT NULL | `mql_date` |
 | **ICP MQL** | Company | `mql_date` IS NOT NULL AND `is_the_company_icp_` = `Yes` | `mql_date`, `is_the_company_icp_` |
-| **SQL** | Deal | `dealstage` = `qualifiedtobuy` (Functional Win) in Sales Pipeline | `dealstage`, `pipeline` = `default` |
-| **MQO** | Deal | `dealstage` = `152224771` (MQO stage) in Sales Pipeline | `dealstage` |
+| **SQL** | Deal | `dealstage` IN (`qualifiedtobuy`, `presentationscheduled`, `28218292`, `contractsent`, `closedwon`, `closedlost`, `217786505`, `175526434`) in Sales Pipeline — any stage reached AFTER Objective Win, including Closed Lost/Sales Nurture/Churn; excludes Objective Win itself, MQO, and DQ | `dealstage`, `pipeline` = `default` |
 | **ICP (company)** | Company | `is_the_company_icp_` = `Yes` | `is_the_company_icp_` |
 | **ICP (contact)** | Contact | `is_the_company_icp` = `Yes` | `is_the_company_icp` |
 | **ICP (deal)** | Deal | `is_the_company_icp__` = `Yes` | `is_the_company_icp__` |
 | **Marketing Pipeline** | Deal | `deal_source` = `Inbound`, `pipeline` = `default`, stage ≠ closed lost | `deal_source`, `amount` |
-| **Lead Priority** | Company/Contact | `lead_priority` enum | `lead_priority` |
-| **Immediate Priority** | Company/Contact | `lead_priority` = `Immediate` | `lead_priority`, `reason_for_immediate` |
 | **ARR / Deal Value** | Deal | `amount` on deal | `amount` |
-| **Churn** | Deal | `dealstage` = `175526434` (Churn) — prefer this deal-level check; only use Company `lifecyclestage` = `1140600340` if asking about the company's overall relationship status, not a specific deal | `dealstage`, `churn_reason` |
 
 > For questions not listed here, compose queries using `search_objects`, `count_objects`, or `get_object_properties` directly.
 
@@ -57,7 +53,8 @@ When a user uses natural language terms, map them as follows. The **Do NOT** rul
 | User Says | Correct Property | Object | Do NOT Use |
 |---|---|---|---|
 | "revenue" / "annual revenue" / "estimated yearly sales" / "yearly sales" | `estimated_yearly_sales__2025_` | Company | `amount`, `revenue`, `annual_revenue` |
-| "source" / "source 1" / "standard source 1" / "original source" | `standard_source_1` | Company | `source_1`, `hs_analytics_source` |
+| "source" / "company source" / "standard source 1" (asking about a Company) | `standard_source_1` (then `standard_source_2` for sub-channel breakdown) | Company | Do NOT use for a Contact-level source question |
+| "source" / "original source" / "contact source" (asking about a Contact) | `hs_analytics_source` (native first-touch web attribution) or `source_1` (Saras custom Inbound/Outbound categorization) — pick based on what's actually being asked | Contact | Do NOT use `standard_source_1` — that's Company-only |
 | "deal source" / "how the deal came in" | `deal_source` | Deal | `standard_source_1`, `source_1` |
 | "MQL" / "marketing qualified lead" / "MQLs" | `mql_date` IS NOT NULL (`HAS_PROPERTY`) | **Company only** — always query the Company object, never Contact | **Do NOT** filter by `lifecyclestage = 'marketingqualifiedlead'` — that stage triggers `mql_date` but is not the source of truth |
 | "ICP" / "ICP company" | `is_the_company_icp_` = `Yes` | Company | **Do NOT** use `icp`, `hs_ideal_customer_profile`, or any other field — only `is_the_company_icp_` is authoritative |
@@ -68,7 +65,7 @@ When a user uses natural language terms, map them as follows. The **Do NOT** rul
 | "spoken to" / "contacted" / "reached out to" | `notes_last_contacted` with date range filter | Contact, Company | Use GTE for start date |
 | "brand" / "brand name" / "company name" (in contact context) | Get associated Company `name` via `get_contacts_with_company_properties` | Contact→Company | Do NOT use the Contact `company` field — it's a free-text string, not a live association |
 | "owner" / "who owns this deal/company" / "[rep name]'s deals" | `hubspot_owner_id` (confirm via `get_object_properties`) | Contact, Company, Deal | Resolve rep name → ID via `list_owners` first, then filter |
-| "meetings booked" / "meeting booked date" | Curated Contact/Company property (verify via `get_object_properties`, query "meeting" — look for "Last Booked Meeting Date" / "Date of last meeting booked in meetings tool") | Contact, Company | Do NOT default to the raw Meetings engagement object's `hs_timestamp` — it includes non-sales meetings and can wildly overcount; see Funnel Milestone playbook for the full fallback order |
+| "meetings booked" / "meeting booked date" | `hs_last_booked_meeting_date` (Company) / `engagements_last_meeting_booked` (Contact) | Contact, Company | Do NOT default to the raw Meetings engagement object's `hs_timestamp` — it includes non-sales meetings and can wildly overcount |
 
 ---
 
@@ -110,9 +107,9 @@ Associations are critical: contacts must be linked to their company; deals must 
 ### SQL — Sales Qualified Lead
 
 - **Object**: Deal
-- **Rule**: `dealstage` = `qualifiedtobuy` (Functional Win) in `pipeline` = `default`
-- **Trigger**: Deal advances from Objective Win → Functional Win
-- **Meaning**: Qualified fit confirmed; real buying intent established
+- **Rule**: `dealstage` IN (`qualifiedtobuy`, `presentationscheduled`, `28218292`, `contractsent`, `closedwon`, `closedlost`, `217786505`, `175526434`) in `pipeline` = `default`
+- **Excludes**: Objective Win itself (`appointmentscheduled` — still at discovery call), MQO (`152224771` — no-show, never qualified), DQ (`175509306` — disqualified on the discovery call itself, never reached Functional Win)
+- **Meaning**: The deal reached Functional Win at some point — qualified fit confirmed, real buying intent established — even if it later moved to Closed Lost, Sales Nurture, or Churn. Do NOT treat SQL as "currently in Functional Win only" — a deal currently in Value Win, Commercial Win, Legal Win, Closed Won, Closed Lost, Sales Nurture, or Churn still counts as SQL.
 
 ---
 
@@ -149,63 +146,9 @@ ICP CHECK (company must pass ALL THREE):
   2. sales_channels INCLUDES "Shopify"
   3. estimated_yearly_sales__2025_ BETWEEN 15,000,000 AND 500,000,000
 
-PASS ALL → is_the_company_icp_ = Yes  → proceed to scoring
-FAIL ANY → is_the_company_icp_ = No   → icp_fit_score = 0, lead_priority = Disqualified
+PASS ALL → is_the_company_icp_ = Yes
+FAIL ANY → is_the_company_icp_ = No
 ```
-
----
-
-### ICP Fit Score & Lead Scoring
-
-- **Company property**: `icp_fit_score` (Number, auto-set)
-- **Contact property**: `saras_icp` (Number)
-
-**Consolidated Scoring Table**:
-
-| Category | Signal | Points | Property |
-|---|---|---|---|
-| **Immediate Triggers** (skip scoring, set priority = Immediate) | New CFO joined (3–12 mo) | — | `has_a_cfo_who_joined_in_the_last_3_12_months` |
-| | New CEO joined (3–12 mo) | — | `has_a_ceo_who_joined_in_the_last_3_12_months` |
-| | Employee came from Saras customer | — | `customer_employee_moved_here` |
-| | Employee left to Saras customer | — | `employee_moved_from_here_to_customer` |
-| | Middleman intro identified | — | `middlemen_identified_for_introductions` |
-| | Referral | — | `reason_for_immediate` = `Referral` |
-| **Industry** | Health & Wellness | +15 | `industry` |
-| | Apparel | +12 | `industry` |
-| | Home & Kitchen | +12 | `industry` |
-| | Sports Apparel | +10 | `industry` |
-| | Food & Beverages | +10 | `industry` |
-| | Beauty / Cosmetics | +8 | `industry` |
-| | Subscription Brand | +8 | `industry` |
-| **Firmographic** | Sells on Amazon / Walmart / TikTok alongside Shopify | +12 | `sales_channels` |
-| | YoY revenue growth > 8% | +10 | `estimated_yearly_sales__2025_` |
-| | Product Bundles / Personalization | +8 | — |
-| | More than 100 SKUs | +6 | — |
-| **Secondary Signals** | Head of Data joined (3–12 mo) | +6 | `has_a_head_of_data_who_joined_in_the_last_3_12_months` |
-| | Migrated to Shopify (3–6 mo) | +6 | `has_migrated_to_shopify_platform_in_the_last_3_6_months` |
-| | CMO joined (3–12 mo) | +5 | `has_a_cmo_who_joined_in_the_last_3_12_months` |
-| | Partner tech: Klaviyo, Recharge, Blotout, Skio, StayAI, Loop | +5 | `has_our_partner_tech__klaviyo__recharge__blotout__skio__stayai__loop` |
-| | Competitor tech: Northbeam, TripleWhale, Polar Analytics | +5 | `has_our_competitors__northbeam__triplewhale__polar_analytics` |
-| | Tech-stack fit: TikTok Shop, Applovin, Fulfil, Fairing, Gorgias, Postscript, Netsuite | +3 | `has_tech_stack_fit__tiktok_shop__applovin__fulfil__fairing__gorgias__postscript__netsuite` |
-
-**Freshness guard**: ~15 point decay if no new signal in 45–90 days. Exec change signals auto-clear after 3–6 months.
-
----
-
-### Lead Priority
-
-| Property | Internal Name | Object | Values |
-|---|---|---|---|
-| Lead Priority | `lead_priority` | Company, Contact | `Immediate` / `High` / `Medium` / `Low` / `Disqualified` |
-| Reason for Immediate | `reason_for_immediate` | Company, Contact | `Exec Change` / `Warm Path` / `Referral` |
-
-| Priority | Trigger | First Touch SLA |
-|---|---|---|
-| `Immediate` | Any Immediate Trigger (exec change / warm path / referral) | ≤ 2 business hours |
-| `High` | `icp_fit_score` ≥ 60 OR high intent (demo booked, pricing inquiry, trial) | ≤ 8 business hours |
-| `Medium` | Score 30–59 OR active evaluation (webinars, case studies) | ≤ 2 business days |
-| `Low` | Score 10–29 OR passive (blog reads, light visits) | Newsletter / nurture only |
-| `Disqualified` | Failed ICP gate | Suppressed |
 
 ---
 
@@ -237,10 +180,11 @@ STAGE ORDERING (for "moved past X" / "after X" queries):
 EXCEPTION PATHS:
   Objective Win → MQO              (no-show; company → Nurture lifecycle)
   Objective Win → DQ               (disqualified on call)
-  Objective Win → Junk             (invalid lead)
   Obj/Func/Value Win → Sales Nurture   (not ready; long-term nurture)
   Any active stage → Closed Lost
 ```
+
+Note: junk leads never get a deal created, so there is no dealstage transition to "Junk" — it's a lifecycle/lead-status outcome only, not part of deal-stage logic.
 
 ### Stage Definitions with Internal Values
 
@@ -284,56 +228,9 @@ EXCEPTION PATHS:
 
 ---
 
-## SECTION 6 — LIFECYCLE STAGES
-
-Property `lifecyclestage` — same values on Company and Contact. **Company-level is authoritative.**
-
-| Display Label | Internal Value | Notes |
-|---|---|---|
-| Lead | `lead` | Fresh lead; no qualification yet |
-| Marketing Qualified Lead | `marketingqualifiedlead` | Triggers `mql_date` on company |
-| First Meeting Booked | `2883794641` | Meeting scheduled — also triggers `mql_date` |
-| Opportunity | `opportunity` | Active deal at FW/CW/LW — also triggers `mql_date` |
-| Customer | `customer` | Closed Won |
-| Closed Lost | `1140600339` | Lost deal |
-| DQ/Duplicate | `1140527924` | Disqualified or duplicate |
-| Nurture | `1140527923` | Long-term nurture (MQO / Sales Nurture outcomes) |
-| Junk | `1140689223` | Invalid / spam |
-| Churn | `1140600340` | Former customer churned |
-| Partner/Advisor/Consultant | `2048777924` | Non-customer relationship |
-| Event Outreach | `2242461411` | Sourced from an event |
-
----
-
-## SECTION 7 — LEAD STATUS
-
-Property `hs_lead_status` — **Contact level only**. Tracks outreach execution state, not funnel position.
-
-| Display Label | Internal Value | Meaning |
-|---|---|---|
-| New | `New` | No outreach yet |
-| In Progress | `In Progress` | BDR / SDR working the contact |
-| Attempted to Connect | `Attempted to Connect` | Calls made; no connection yet |
-| Contacted | `Contacted` | Spoken; conversation in progress |
-| Interested | `Interested` | Interested; meeting not yet booked |
-| Call booked | `Call booked` | Meeting / discovery call booked |
-| Not interested/DQ | `Not interested/DQ` | Not interested or disqualified |
-| No response | `No response` | No reply from lead |
-| Junk | `Junk` | Invalid / junk lead |
-| Future Interest | `Future Interest` | Asked to be contacted later |
-| Open Deal | `Open Deal` | Active deal — auto-set |
-| Customer | `Customer` | Closed Won — auto-set |
-| Closed Lost | `Closed Lost` | Deal closed lost |
-| Churn | `Churn` | Customer churned |
-| Partner/Advisor/Consultant | `Partner/Advisor/Consultant` | Non-customer relationship |
-| Disqualified | `Disqualified` | Formally disqualified |
-| Nurture | `Nurture` | Long-term nurture |
-
----
-
 ## SECTION 8 — SOURCE ATTRIBUTION
 
-> **Agent disambiguation**: When a user says "source" without specifying an object, use `standard_source_1` for Company and `deal_source` for Deal. "Marketing sources" means `standard_source_1 = 'Marketing'` on Company — the specific channel breakdown is in `standard_source_2` (Email, SEO, Webinar, PPC, etc.).
+> **Agent disambiguation**: When a user says "source" without specifying an object, use `standard_source_1` for Company, `deal_source` for Deal, and `hs_analytics_source` (native) or `source_1` (Saras custom Inbound/Outbound) for Contact — never `standard_source_1` for a Contact, it's Company-only. "Marketing sources" means `standard_source_1 = 'Marketing'` on Company — the specific channel breakdown is in `standard_source_2` (Email, SEO, Webinar, PPC, etc.).
 
 ### Company Sources
 
@@ -388,7 +285,9 @@ Tracked at the **Deal** level — which Saras product is being sold.
 | Property | Internal Name | Object | Values |
 |---|---|---|---|
 | Saras Offering | `daton_subscription` | Deal | Daton Enterprise / Daton Business / Saras Pulse / Saras IQ / Pulse Essentials / Daton Growth / ChargeBee – Business / ChargeBee – Growth / ChargeBee – Starter / ChargeBee – Lite / Consulting / DE / Pulse Implementation / Product Referral |
-| Product Name | `product_name` | Company, Deal | Pulse / Daton / iQ / Daton Embed (Company); Pulse / Others / NA (Deal) |
+| Product Name | `product_name` | Company | Pulse / Daton / iQ / Daton Embed |
+
+Check `product_name` on the Company first for "what product/offering" questions. Only if it's unavailable, fall back to Saras Offering (`daton_subscription`) on the Deal.
 
 **Revenue / ARR**: `amount` on Deal = contract value / ARR per deal. Billing source of truth is Chargebee (not directly synced to HubSpot).
 
