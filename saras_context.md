@@ -68,6 +68,7 @@ When a user uses natural language terms, map them as follows. The **Do NOT** rul
 | "spoken to" / "contacted" / "reached out to" | `notes_last_contacted` with date range filter | Contact, Company | Use GTE for start date |
 | "brand" / "brand name" / "company name" (in contact context) | Get associated Company `name` via `get_contacts_with_company_properties` | Contact→Company | Do NOT use the Contact `company` field — it's a free-text string, not a live association |
 | "owner" / "who owns this deal/company" / "[rep name]'s deals" | `hubspot_owner_id` (confirm via `get_object_properties`) | Contact, Company, Deal | Resolve rep name → ID via `list_owners` first, then filter |
+| "meetings booked" / "meeting booked date" | Curated Contact/Company property (verify via `get_object_properties`, query "meeting" — look for "Last Booked Meeting Date" / "Date of last meeting booked in meetings tool") | Contact, Company | Do NOT default to the raw Meetings engagement object's `hs_timestamp` — it includes non-sales meetings and can wildly overcount; see Funnel Milestone playbook for the full fallback order |
 
 ---
 
