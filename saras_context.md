@@ -44,7 +44,7 @@ Saras business metrics and their exact HubSpot filter rules. Start here for any 
 | **Lead Priority** | Company/Contact | `lead_priority` enum | `lead_priority` |
 | **Immediate Priority** | Company/Contact | `lead_priority` = `Immediate` | `lead_priority`, `reason_for_immediate` |
 | **ARR / Deal Value** | Deal | `amount` on deal | `amount` |
-| **Churn** | Deal | `dealstage` = `175526434` (Churn) or Company `lifecyclestage` = `1140600340` | `dealstage`, `churn_reason` |
+| **Churn** | Deal | `dealstage` = `175526434` (Churn) — prefer this deal-level check; only use Company `lifecyclestage` = `1140600340` if asking about the company's overall relationship status, not a specific deal | `dealstage`, `churn_reason` |
 
 > For questions not listed here, compose queries using `search_objects`, `count_objects`, or `get_object_properties` directly.
 
@@ -52,7 +52,7 @@ Saras business metrics and their exact HubSpot filter rules. Start here for any 
 
 ## SECTION 1B — TERM ALIASES & COMMON MISTAKES
 
-When a user uses natural language terms, map them as follows. The **Do NOT** rules are critical — these are the wrong properties Claude would otherwise guess.
+When a user uses natural language terms, map them as follows. The **Do NOT** rules are critical — these are the wrong properties Claude would otherwise guess. These aliases are for natural-language phrasing — if the user's wording looks like it's quoting an exact property label (specific casing, units like "(USD)", quotation marks), verify that literal property exists via `get_object_properties` first; a real matching HubSpot property wins over the heuristic mapping below.
 
 | User Says | Correct Property | Object | Do NOT Use |
 |---|---|---|---|

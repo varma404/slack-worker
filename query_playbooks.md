@@ -29,8 +29,7 @@ Example: "CXOs at ICP companies" → get_contacts_with_company_properties with j
    - If the condition is on the company (e.g. "ICP companies"), use get_companies_with_deal_properties with company_filters, then read each result's deals array directly — no second hop needed if that's all the question asks.
 2. Collect the distinct company IDs that pass the condition from step 1.
 3. For the CONTACT hop: there is no batch tool that accepts a company-ID list as input. Call get_associations with object_type: "companies", to_object_type: "contacts" once per qualifying company ID from step 2, then fetch contact details via get_contacts_with_company_properties (filtered by any contact-level condition) or get_contact for the final small set.
-4. This is only efficient when step 1's qualifying-company set is small (roughly under 20-30). If it's larger, report the company-level count and ask the user whether they want the full contact list before looping get_associations across dozens of companies.
-5. Do NOT call get_associations per deal or per contact as a substitute for step 1's batch filter — the batch call must absorb the stage/property condition; get_associations is only for the final company→contact hop, after the company set is already narrowed.
+4. Efficient only when step 1's qualifying-company set is small (roughly under 20-30) — if larger, report the company-level count and ask before looping get_associations across dozens of companies. Never use get_associations as a substitute for step 1's batch filter itself (e.g. calling it per-deal or per-contact) — it's only for the final company→contact hop, after the set is already narrowed.
 
 Note: there is no single-call three-hop batch tool (contacts + their company + that company's deals) — this recipe is the most efficient path with current tools.
 
@@ -77,10 +76,11 @@ For "X vs Y ratio" or "X vs Y trend", make count_objects calls for each category
 - "Deal value" / "deal amount" / "ARR" → amount on Deal
 - "Company revenue" / "annual revenue" / "revenue" when filtering companies → estimated_yearly_sales__2025_ on Company
 - If a question says "deals with revenue < $X" without specifying deal or company, default to company revenue (estimated_yearly_sales__2025_) via get_deals_with_company_properties unless the user specifically says "deal amount".
+- "Deals closed/won in [period]" / "customers acquired in [period]" → filter Deal `closedate` GTE/LTE the period AND `dealstage` = `closedwon` — do NOT use `createdate` (that's when the deal was opened, not when it closed).
 
 ## Funnel Milestone Queries
 
-FUNNEL MILESTONE QUERIES ("how many reached X", "how many booked first meeting", "how many got to demo"):
+FUNNEL MILESTONE QUERIES ("how many reached X", "how many booked first meeting", "meetings booked", "booked a meeting", "scheduled a call", "how many got to demo"):
 Both lifecycle stage AND deal stage reflect CURRENT position only, not history. Do NOT use lifecycle stage alone for funnel milestone counts.
 
 FIRST MEETING HAPPENED — correct definition:
@@ -94,6 +94,9 @@ Full "first meeting happened" dealstage IN list (use this):
   closedwon, closedlost, 217786505, 175509306, 175526434
 
 This correctly includes Sales Nurture (217786505), DQ (175509306), Closed Lost, and Churn — all require a meeting to have entered. A deal that went Objective Win → Sales Nurture or DQ STILL had its first meeting.
+
+MILESTONE REACHED IN A TIME WINDOW ("meetings booked in the last N days", "deals that reached Commercial Win this month"):
+The definitions above tell you CURRENT status only, not WHEN a deal entered that stage — dealstage has no built-in transition timestamp. Before combining a milestone with a date range, check whether HubSpot exposes an entry-date property for that stage: call get_object_properties with object_type: "deals", include_internal: true, query: "date_entered" — HubSpot auto-generates hs_date_entered_<stageId> properties per pipeline stage on most portals. If found, filter GTE/LTE on the matching stage's date_entered property. If genuinely unavailable, do NOT silently substitute createdate (that's when the deal record was created, not when it reached the stage) — say so explicitly in **Notes:** and offer the closest honest alternative ("created in this window AND currently at this stage" vs "ever reached this stage, any date") as an explicit choice.
 
 For deeper funnel milestones:
   - "SQL / Functional Win reached" → dealstage IN: qualifiedtobuy, presentationscheduled, 28218292, contractsent, closedwon, closedlost, 217786505
