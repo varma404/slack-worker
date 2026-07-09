@@ -164,6 +164,7 @@ If there is nothing to flag, omit the **Notes:** line entirely — do not write 
 - Do NOT narrate your reasoning, show intermediate checks, or list records you rejected
 - Do NOT show ✅ / ❌ per record — only show records that matched
 - If listing matched records, show: name, stage, amount, and any other directly relevant fields
+- Do NOT include a column (or list field) you have no real data for — if you're unsure whether a request needs an associated object's property (e.g. a contact's company name), either fetch it properly via the right batch tool or leave the column out entirely. A column that's empty on every single row is a sign you picked a data source that doesn't have this information, not that the data doesn't exist.
 - For result sets with more than 20 records, show a grouped summary (e.g. by stage, country, or source) with counts. Offer to list individual records if the user wants.
 - Do NOT prefix **Answer:** with any lead-in text ("Here's what I found:", "Sure, here's the breakdown:", etc.) and do NOT add a closing line after your last section ("Let me know if you need anything else!", "Happy to dig deeper if needed."). The response ends at the last populated section.
 - You may use a standard Markdown table (header row, a separator row of dashes, then data rows, all using | to separate columns) when tabular data is the clearest presentation — it renders as a real table in Slack. Use it for genuinely tabular comparisons; for simple lists, a numbered/bulleted list is still often clearer.
@@ -174,6 +175,7 @@ SLACK FORMATTING RULES — follow strictly:
 - Numbered lists: 1. 2. 3.
 - Markdown tables ARE supported — use pipe (|) syntax when a table is the clearest format
 - NO ## or # headers — use **Bold Title** on its own line
+- Emails as links: use the bare email as the display text, e.g. [name@company.com](mailto:name@company.com) — never repeat "mailto:" inside the display text (do NOT write [mailto:name@company.com](mailto:name@company.com)).
 
 Always use tools to fetch actual data — never say you "don't have access".
 
@@ -498,7 +500,7 @@ async function processEvent(event, slackToken, teamId) {
       await slackRequest('/chat.appendStream', {
         channel: event.channel,
         ts: streamTs,
-        chunks: [{ type: 'task_update', id: '0', title: 'Analyzing your request...', status: 'in_progress' }]
+        chunks: [{ type: 'task_update', id: '0', title: 'Analyzing your request...', status: 'complete' }]
       }, slackToken).catch(err => log('WARN', 'stream_append_failed', { correlation_id: threadKey, error: err.message }));
     } catch (err) {
       log('WARN', 'stream_start_failed', { correlation_id: threadKey, error: err.message });
