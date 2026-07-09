@@ -55,7 +55,14 @@ const MAX_HISTORY_MESSAGES = 40;
 
 function getThreadKey(event) {
   if (event.thread_ts) return `${event.channel}:${event.thread_ts}`;
-  return `${event.channel}:${event.user || event.ts}`;
+  // A fresh channel mention must key on its own ts, not the user — Slack
+  // sets a threaded reply's thread_ts to the parent message's own ts, so
+  // this is the only value a later reply can ever match. DMs don't thread
+  // ordinary back-and-forth turns at all, so they need a key that's stable
+  // across the whole conversation instead — the channel id alone already
+  // uniquely identifies that 1:1 (or group) DM.
+  if (event.channel_type === 'im') return event.channel;
+  return `${event.channel}:${event.ts}`;
 }
 
 function getThreadMessages(threadKey) {
