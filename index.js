@@ -489,6 +489,17 @@ async function processEvent(event, slackToken, teamId) {
         ts: streamTs,
         chunks: [{ type: 'plan_update', title: 'Working on it...' }]
       }, slackToken).catch(err => log('WARN', 'stream_append_failed', { correlation_id: threadKey, error: err.message }));
+      // Gives the accordion real step content the instant the container
+      // exists, instead of leaving it empty until the first Claude turn
+      // returns (which, on adaptive thinking, has no fixed latency ceiling)
+      // — that empty window is exactly when Slack renders its own default
+      // "Thinking..." placeholder inside the stream message. Real tool
+      // steps start at id '1' via toolStepCount++, so id '0' can't collide.
+      await slackRequest('/chat.appendStream', {
+        channel: event.channel,
+        ts: streamTs,
+        chunks: [{ type: 'task_update', id: '0', title: 'Analyzing your request...', status: 'in_progress' }]
+      }, slackToken).catch(err => log('WARN', 'stream_append_failed', { correlation_id: threadKey, error: err.message }));
     } catch (err) {
       log('WARN', 'stream_start_failed', { correlation_id: threadKey, error: err.message });
     }
