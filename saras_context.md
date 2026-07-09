@@ -19,7 +19,7 @@ last_verified: 2026-06-20
 >
 > **Example of how to combine both:**
 > *"List CXOs my team has spoken to in the last 3 months who are ICP with their brand name and LinkedIn"*
-> → ICP definition = this file: `is_the_company_icp` = `Yes` on Contact (or `is_the_company_icp_` on Company)
+> → ICP definition = this file: `is_the_company_icp` = `true` on Contact (or `is_the_company_icp_` on Company)
 > → "spoken to" = `notes_last_contacted` on Contact, filter last 90 days
 > → CXO filter = `jobtitle` CONTAINS_TOKEN CEO/CFO/CTO/CMO/COO on Contact
 > → Use `get_contacts_with_company_properties` to get contacts with company `name` and `is_the_company_icp_` in one call
@@ -34,11 +34,11 @@ Saras business metrics and their exact HubSpot filter rules. Start here for any 
 | Metric | Object | HubSpot Rule | Key Properties |
 |---|---|---|---|
 | **MQL** | Company | `mql_date` IS NOT NULL | `mql_date` |
-| **ICP MQL** | Company | `mql_date` IS NOT NULL AND `is_the_company_icp_` = `Yes` | `mql_date`, `is_the_company_icp_` |
+| **ICP MQL** | Company | `mql_date` IS NOT NULL AND `is_the_company_icp_` = `true` | `mql_date`, `is_the_company_icp_` |
 | **SQL** | Deal | `dealstage` IN (`qualifiedtobuy`, `presentationscheduled`, `28218292`, `contractsent`, `closedwon`, `closedlost`, `217786505`, `175526434`) in Sales Pipeline — any stage reached AFTER Objective Win, including Closed Lost/Sales Nurture/Churn; excludes Objective Win itself, MQO, and DQ | `dealstage`, `pipeline` = `default` |
-| **ICP (company)** | Company | `is_the_company_icp_` = `Yes` | `is_the_company_icp_` |
-| **ICP (contact)** | Contact | `is_the_company_icp` = `Yes` | `is_the_company_icp` |
-| **ICP (deal)** | Deal | `is_the_company_icp__` = `Yes` | `is_the_company_icp__` |
+| **ICP (company)** | Company | `is_the_company_icp_` = `true` | `is_the_company_icp_` |
+| **ICP (contact)** | Contact | `is_the_company_icp` = `true` | `is_the_company_icp` |
+| **ICP (deal)** | Deal | `is_the_company_icp__` = `true` | `is_the_company_icp__` |
 | **Marketing Pipeline** | Deal | `deal_source` = `Inbound`, `pipeline` = `default`, stage ≠ closed lost | `deal_source`, `amount` |
 | **ARR / Deal Value** | Deal | `amount` on deal | `amount` |
 
@@ -57,9 +57,9 @@ When a user uses natural language terms, map them as follows. The **Do NOT** rul
 | "source" / "original source" / "contact source" (asking about a Contact) | `hs_analytics_source` (native first-touch web attribution) or `source_1` (Saras custom Inbound/Outbound categorization) — pick based on what's actually being asked | Contact | Do NOT use `standard_source_1` — that's Company-only |
 | "deal source" / "how the deal came in" | `deal_source` | Deal | `standard_source_1`, `source_1` |
 | "MQL" / "marketing qualified lead" / "MQLs" | `mql_date` IS NOT NULL (`HAS_PROPERTY`) | **Company only** — always query the Company object, never Contact | **Do NOT** filter by `lifecyclestage = 'marketingqualifiedlead'` — that stage triggers `mql_date` but is not the source of truth |
-| "ICP" / "ICP company" | `is_the_company_icp_` = `Yes` | Company | **Do NOT** use `icp`, `hs_ideal_customer_profile`, or any other field — only `is_the_company_icp_` is authoritative |
-| "ICP contact" | `is_the_company_icp` = `Yes` | Contact | Note: one fewer trailing underscore than the Company version |
-| "ICP deal" | `is_the_company_icp__` = `Yes` | Deal | Note: two trailing underscores |
+| "ICP" / "ICP company" | `is_the_company_icp_` = `true` | Company | **Do NOT** use `icp`, `hs_ideal_customer_profile`, or any other field — only `is_the_company_icp_` is authoritative. **Do NOT** filter with the string `"Yes"` — HubSpot displays this checkbox as "Yes"/"No" but the real filterable value is `true`/`false`. |
+| "ICP contact" | `is_the_company_icp` = `true` | Contact | Note: one fewer trailing underscore than the Company version |
+| "ICP deal" | `is_the_company_icp__` = `true` | Deal | Note: two trailing underscores |
 | "marketing source" / "marketing sourced" | `standard_source_1` = `Marketing` on Company; then `standard_source_2` for sub-channel breakdown | Company | `deal_source = 'Inbound'` is the deal-level equivalent, not the same thing |
 | "CXO" / "C-level" / "C-suite" / "executives" | `jobtitle` CONTAINS_TOKEN each of: `CEO`, `CFO`, `CTO`, `CMO`, `COO`, `Chief` | Contact | Search per title separately, combine and deduplicate by contact ID |
 | "spoken to" / "contacted" / "reached out to" | `notes_last_contacted` with date range filter | Contact, Company | Use GTE for start date |
@@ -98,9 +98,9 @@ Associations are critical: contacts must be linked to their company; deals must 
 ### ICP MQL
 
 - **Object**: Company
-- **Rule**: `mql_date` IS NOT NULL **AND** `is_the_company_icp_` = `Yes`
+- **Rule**: `mql_date` IS NOT NULL **AND** `is_the_company_icp_` = `true`
 - **Not a property** — applied as a combined filter
-- **Count query**: `SELECT COUNT(*) FROM COMPANY WHERE mql_date IS NOT NULL AND is_the_company_icp_ = 'Yes'`
+- **Count query**: `SELECT COUNT(*) FROM COMPANY WHERE mql_date IS NOT NULL AND is_the_company_icp_ = 'true'`
 
 ---
 
@@ -133,7 +133,7 @@ Associations are critical: contacts must be linked to their company; deals must 
 | Contact | `is_the_company_icp` | Marketing team |
 | Deal | `is_the_company_icp__` | Sales rep (verified on call) |
 
-Values: `Yes` / `No`
+Values: `true` / `false` (HubSpot's UI displays these as "Yes"/"No", but the API/filter value is the boolean-style string, on all three ICP properties — Company, Contact, and Deal alike)
 
 **ICP Workflow Decision Tree** — Company must pass ALL three:
 
@@ -146,8 +146,8 @@ ICP CHECK (company must pass ALL THREE):
   2. sales_channels INCLUDES "Shopify"
   3. estimated_yearly_sales__2025_ BETWEEN 15,000,000 AND 500,000,000
 
-PASS ALL → is_the_company_icp_ = Yes
-FAIL ANY → is_the_company_icp_ = No
+PASS ALL → is_the_company_icp_ = true
+FAIL ANY → is_the_company_icp_ = false
 ```
 
 ---

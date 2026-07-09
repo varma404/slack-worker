@@ -10,7 +10,7 @@ Use the IN operator with all stages past the named one. Do NOT include closedlos
 ## Cross-Object Mismatch Queries
 
 Questions comparing a property on one object against a property on its associated object (e.g. "deals marked ICP but the company is marked non-ICP", "contacts flagged as X but their company says Y"):
-1. Identify which side's OWN filters are more selective — usually whichever side has more distinct conditions stacked together (e.g. "non-ICP AND MQL'd in 2026 AND sourced from marketing" on the company side is far more selective than "ICP = Yes" alone on the deal side).
+1. Identify which side's OWN filters are more selective — usually whichever side has more distinct conditions stacked together (e.g. "non-ICP AND MQL'd in 2026 AND sourced from marketing" on the company side is far more selective than "ICP = true" alone on the deal side).
 2. Use the batch tool anchored on that more-selective side: `get_companies_with_deal_properties` (company-side filters, returns each company's associated deals) or `get_deals_with_company_properties` (deal-side filters, returns each deal's associated company) — whichever pushes the most conditions down as real HubSpot filters.
 3. Fetch that one batch, then do the actual mismatch check (comparing the two objects' property values) yourself across the returned records — this is reasoning, not another tool call.
 4. NEVER call `get_deal` or `get_company` more than 2-3 times in a row to check individual records against a condition — if you find yourself doing this, stop and restructure the query as a batch call on the more selective side instead. Repeated single-record lookups don't scale and burn far more tokens than a single batch call.
@@ -19,7 +19,7 @@ Questions comparing a property on one object against a property on its associate
 
 Cross-object contact + company questions:
 For questions needing contact details WITH company properties (name, ICP, revenue), use get_contacts_with_company_properties. This handles the batch lookup in one call.
-Example: "CXOs at ICP companies" → get_contacts_with_company_properties with jobtitle filter + request company is_the_company_icp_ property, then filter results where company.is_the_company_icp_ = Yes.
+Example: "CXOs at ICP companies" → get_contacts_with_company_properties with jobtitle filter + request company is_the_company_icp_ property, then filter results where company.is_the_company_icp_ = true.
 
 ## Multi-Hop Association Chain Queries
 

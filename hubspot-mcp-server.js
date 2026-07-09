@@ -381,7 +381,17 @@ async function executeTool(name, input, context = {}) {
       case 'get_object_properties': {
         const res = await hubspotRequest('GET', `/crm/v3/properties/${input.object_type}`);
         let props = (res.results || [])
-          .map(p => ({ name: p.name, label: p.label, type: p.type, fieldType: p.fieldType }));
+          .map(p => ({
+            name: p.name,
+            label: p.label,
+            type: p.type,
+            fieldType: p.fieldType,
+            // Surfaces real filterable value/label pairs for checkbox and
+            // enum properties (e.g. { value: "true", label: "Yes" }) — the
+            // display label alone is not always the value HubSpot expects
+            // in a filter.
+            ...(p.options?.length ? { options: p.options.map(o => ({ value: o.value, label: o.label })) } : {})
+          }));
         if (!input.include_internal) {
           props = props.filter(p => !p.name.startsWith('hs_'));
         }
